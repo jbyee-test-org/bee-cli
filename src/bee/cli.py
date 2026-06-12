@@ -110,14 +110,14 @@ def _chart_warnings(module_yaml: Path, chart: Path, platform_yaml: Path | None) 
                 _warn(f"chart 지원 범위 검사 불가({e}) — 건너뜀")
 
 
-def _render(chart: Path, mdir: Path, env: str, name: str) -> str:
+def _render(chart: Path, mdir: Path, env: str, name: str, set_values: tuple[str, ...] = ()) -> str:
     values = mdir / f"values-{env}.yaml"
     if not values.exists():
         _fail(f"{name}: values-{env}.yaml 없음: {mdir}")
-    r = subprocess.run(
-        ["helm", "template", name, str(chart), "-f", str(mdir / "module.yaml"), "-f", str(values)],
-        capture_output=True, text=True,
-    )
+    cmd = ["helm", "template", name, str(chart), "-f", str(mdir / "module.yaml"), "-f", str(values)]
+    for sv in set_values:
+        cmd += ["--set", sv]
+    r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0:
         _fail(f"{name}: helm 렌더 실패\n{r.stderr.strip()}")
     return r.stdout
@@ -157,10 +157,19 @@ def _module_data(name: str, overrides: dict[str, Path], snaps: dict) -> dict:
     return _yaml_at(snaps[name].module_yaml)
 
 
+def _snapshot_path(root: Path, ws: wsm.Workspace) -> Path:
+    repo = ws.snapshot_repo or ""
+    if not repo:
+        _fail("snapshot 경로 필요: bee.workspace.yaml 의 snapshot.repo")
+    p = Path(repo) if Path(repo).is_absolute() else (root / repo)
+    if not p.exists():
+        _fail(f"snapshot 경로 없음(로컬만 지원, git URL 은 후속): {p}")
+    return p
+
+
 def _write_lock(root: Path, ws: wsm.Workspace, overrides: dict[str, Path]) -> str:
     """up 이 snapshot SHA + local 커밋을 pin (규칙 8). Phase 1 은 기록 — refresh 의미는 Phase 2."""
-    snap_repo = ws.snapshot_repo or ""
-    snap_path = (root / snap_repo) if not Path(snap_repo).is_absolute() else Path(snap_repo)
+    snap_path = _snapshot_path(root, ws)
     commit = kube.git(["rev-parse", "HEAD"], snap_path)
     lock: dict = {
         "snapshot": {"repo": ws.snapshot_repo, "env": ws.env, "ref": ws.snapshot_ref, "commit": commit},
@@ -240,11 +249,11 @@ def down_impl(root: Path, ws: wsm.Workspace, *, remote_ok: bool = False) -> None
 def status_impl(root: Path, ws: wsm.Workspace) -> None:
     lock_f = root / wsm.LOCK_FILE
     if not lock_f.exists():
-        _fail("pin 없음 — `bee up` 이 먼저다(규칙 8: 명시 pin)")
+        typer.secho("  pin 없음 — 첫 `bee up` 이 snapshot pin 을 기록한다(규칙 8)", dim=True)
+        return
     lock = _yaml_at(lock_f)
     pin = (lock.get("snapshot") or {}).get("commit") or ""
-    snap_repo = ws.snapshot_repo or ""
-    snap_path = (root / snap_repo) if not Path(snap_repo).is_absolute() else Path(snap_repo)
+    snap_path = _snapshot_path(root, ws)
     head = kube.git(["rev-parse", "HEAD"], snap_path)
     if pin == head:
         _ok(f"baseline 최신 — snapshot@{pin[:7]}")
@@ -259,6 +268,54 @@ def status_impl(root: Path, ws: wsm.Workspace) -> None:
         _warn(f"내 서브그래프 변경: {', '.join(changed)} (pin {pin[:7]} → HEAD {head[:7]}) — 갱신은 `bee up`(명시)")
     else:
         _ok(f"pin {pin[:7]} ≠ HEAD {head[:7]} 이나 내 서브그래프 변경 없음 — 무관 churn 무시(규칙 8)")
+
+
+def publish_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Workspace, *,
+                 digest: str = "", push: bool = False) -> None:
+    """렌더(digest pin) + 스냅샷 엔트리 기록 + 커밋 — 기계적 기록만, 검증은 CI 게이트1(규칙 2).
+
+    공유 env 전용(규칙 7). CI 가 headless 로 재사용하는 경로(G5) — dev 는 직접 커밋(G8).
+    """
+    if env == "local":
+        _fail("publish 는 공유 env 전용 — 로컬 상태는 스냅샷에 기록하지 않는다(규칙 7). "
+              "로컬 구성 공유는 워크스페이스 파일로.")
+    overrides = wsm.override_dirs(ws, root)
+    names = targets or sorted(overrides)
+    unknown = [n for n in names if n not in overrides]
+    if unknown:
+        _fail(f"publish 는 편집 표면(from-local) 전용(규칙 5): {', '.join(unknown)}")
+    if digest and len(names) != 1:
+        _fail("--digest 는 모듈 1개와 함께만 사용한다 (모듈별 digest 가 다르다)")
+    chart = wsm.chart_dir(ws, root)
+    pyaml = wsm.platform_yaml_path(ws, root)
+    snap_path = _snapshot_path(root, ws)
+    env_dir = snap_path / "envs" / env
+    for name in names:
+        mdir = overrides[name]
+        _chart_warnings(mdir / "module.yaml", chart, pyaml)
+        sets = (f"imageDigest={digest}",) if digest else ()
+        manifests = _render(chart, mdir, env, name, set_values=sets)
+        spec = _yaml_at(mdir / "module.yaml").get("spec") or {}
+        prov = {
+            "module": name,
+            "repoUrl": kube.git(["remote", "get-url", "origin"], mdir) or str(mdir),
+            "moduleCommit": kube.git(["rev-parse", "HEAD"], mdir),
+            "imageDigest": digest,
+            "chartVersion": str((spec.get("chart") or {}).get("version") or ""),
+            "dependsOn": list(spec.get("dependsOn") or []),
+        }
+        snap_mod.write_entry(env_dir, name, mdir / "module.yaml", manifests, provenance=prov)
+        _ok(f"{name} → envs/{env}/{name}  "
+            + ("(digest pin)" if digest else "(digest 없음 — 게이트1이 차단한다)"))
+    kube.run(["git", "-C", str(snap_path), "add", f"envs/{env}"])
+    if not kube.git(["status", "--porcelain", "--", f"envs/{env}"], snap_path):
+        typer.secho("  무변경 — 커밋 생략 (diff = 실질 변경, G8)", dim=True)
+        return
+    kube.run(["git", "-C", str(snap_path), "commit", "-q", "-m", f"publish({env}): {' '.join(names)}"])
+    _ok(f"snapshot 커밋 {kube.git(['rev-parse', '--short', 'HEAD'], snap_path)}")
+    if push:
+        kube.run(["git", "-C", str(snap_path), "push", "-q"])
+        _ok("snapshot push — 적용은 CD(ArgoCD)의 몫(G5: CLI 의 공유환경 출력은 git 까지)")
 
 
 # ── 커맨드 ────────────────────────────────────────────────────────────────────
@@ -308,6 +365,18 @@ def down(
     """워크로드 내림 — plan 전체 delete. 데이터·namespace 보존(규칙 9). 부분 down 없음."""
     root, ws = load_ctx()
     down_impl(root, ws, remote_ok=remote_ok)
+
+
+@app.command()
+def publish(
+    env: str = typer.Argument(..., help="공유 env (dev/staging/prod) — local 금지(규칙 7)"),
+    modules: list[str] = typer.Argument(None, help="기본: 편집 표면 전체"),
+    digest: str = typer.Option("", "--digest", help="이미지 digest (CI 가 주입 — 모듈 1개와만)"),
+    push: bool = typer.Option(False, "--push", help="커밋 후 원격 push"),
+):
+    """스냅샷 레포 커밋 — 이미지 push 는 build/CI 몫(분리). 검증은 CI 게이트1(규칙 2)."""
+    root, ws = load_ctx()
+    publish_impl(env, list(modules) if modules else None, root, ws, digest=digest, push=push)
 
 
 @app.command()
