@@ -55,6 +55,7 @@ class Workspace:
     snapshot_ref: str = "main"
     core_infra: str | None = None        # 경로 또는 URL (G5 — 1-바인딩)
     platform: str | None = None          # platforms/<name>/platform.yaml
+    chart_ref: str | None = None         # oci://… — 있으면 OCI 소비(G6), 모듈 pin 이 --version
     cluster_context: str | None = None   # 인너루프 클러스터 kubectl 컨텍스트 (G7)
     locals: dict[str, LocalOverride] = field(default_factory=dict)
 
@@ -79,6 +80,8 @@ class Workspace:
                 ci["path"] = self.core_infra
             if self.platform:
                 ci["platform"] = self.platform
+            if self.chart_ref:
+                ci["chartRef"] = self.chart_ref
             doc["coreInfra"] = ci
         if self.cluster_context:
             doc["cluster"] = {"context": self.cluster_context}
@@ -104,6 +107,7 @@ class Workspace:
             snapshot_ref=snap.get("ref", "main"),
             core_infra=ci.get("path"),
             platform=ci.get("platform"),
+            chart_ref=ci.get("chartRef"),
             cluster_context=(data.get("cluster") or {}).get("context"),
             locals=locals_,
         )

@@ -93,7 +93,7 @@ def _namespace(name: str, mdata: dict, products: dict[str, str]) -> str:
 def _chart_warnings(module_yaml: Path, chart: Path, platform_yaml: Path | None) -> None:
     """G6 — 버전 대조는 전 경로 경고만. 차단은 CI lint(규칙 2)."""
     pin = ((_yaml_at(module_yaml).get("spec") or {}).get("chart") or {}).get("version")
-    actual = _yaml_at(chart / "Chart.yaml").get("version")
+    actual = _yaml_at(chart / "Chart.yaml").get("version") if isinstance(chart, Path) else None
     if pin and actual and str(pin) != str(actual):
         _warn(f"모듈 chart pin {pin} ≠ chart 실버전 {actual} — 렌더는 계속, 차단은 CI")
     if pin and platform_yaml:
@@ -110,11 +110,24 @@ def _chart_warnings(module_yaml: Path, chart: Path, platform_yaml: Path | None) 
                 _warn(f"chart 지원 범위 검사 불가({e}) — 건너뜀")
 
 
-def _render(chart: Path, mdir: Path, env: str, name: str, set_values: tuple[str, ...] = ()) -> str:
+def _chart_source(ws: wsm.Workspace, root: Path):
+    """chart 해석(G6) — coreInfra.chartRef(oci://…)가 있으면 OCI(모듈 pin 이 --version), 없으면 경로."""
+    return ws.chart_ref if ws.chart_ref else wsm.chart_dir(ws, root)
+
+
+def _pin(mdir: Path) -> str | None:
+    return ((_yaml_at(mdir / "module.yaml").get("spec") or {}).get("chart") or {}).get("version")
+
+
+def _render(chart, mdir: Path, env: str, name: str, set_values: tuple[str, ...] = ()) -> str:
     values = mdir / f"values-{env}.yaml"
     if not values.exists():
         _fail(f"{name}: values-{env}.yaml 없음: {mdir}")
     cmd = ["helm", "template", name, str(chart), "-f", str(mdir / "module.yaml"), "-f", str(values)]
+    if isinstance(chart, str) and chart.startswith("oci://"):
+        ver = _pin(mdir)
+        if ver:
+            cmd += ["--version", str(ver)]
     for sv in set_values:
         cmd += ["--set", sv]
     r = subprocess.run(cmd, capture_output=True, text=True)
@@ -205,7 +218,7 @@ def up_impl(roots: list[str] | None, root: Path, ws: wsm.Workspace, *, no_build:
     ctx = _cluster(ws, remote_ok)
     overrides, snaps, res = plan(ws, root, roots)
     products = _products(ws, root)
-    chart = wsm.chart_dir(ws, root)
+    chart = _chart_source(ws, root)
     pyaml = wsm.platform_yaml_path(ws, root)
     for name in res.order:
         if name not in overrides and name not in snaps:
@@ -233,7 +246,7 @@ def down_impl(root: Path, ws: wsm.Workspace, *, remote_ok: bool = False) -> None
     ctx = _cluster(ws, remote_ok)
     overrides, snaps, res = plan(ws, root)
     products = _products(ws, root)
-    chart = wsm.chart_dir(ws, root)
+    chart = _chart_source(ws, root)
     for name in reversed(res.order):  # 의존 역순으로 내림
         if name not in overrides and name not in snaps:
             continue
@@ -286,7 +299,7 @@ def publish_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Worksp
         _fail(f"publish 는 편집 표면(from-local) 전용(규칙 5): {', '.join(unknown)}")
     if digest and len(names) != 1:
         _fail("--digest 는 모듈 1개와 함께만 사용한다 (모듈별 digest 가 다르다)")
-    chart = wsm.chart_dir(ws, root)
+    chart = _chart_source(ws, root)
     pyaml = wsm.platform_yaml_path(ws, root)
     products = _products(ws, root)
     snap_path = _snapshot_path(root, ws)
@@ -353,6 +366,36 @@ def pull_impl(modules: list[str], root: Path, ws: wsm.Workspace) -> None:
         typer.secho("  (bee.workspace.yaml 갱신 — 등록 해제는 local: 항목 제거)", dim=True)
 
 
+def new_impl(name: str, root: Path, ws: wsm.Workspace) -> None:
+    """starter 복사 + 이름 치환 + 워크스페이스 등록 (G5). 치환은 이름만 —
+    변형(언어/유형)은 조건 분기가 아니라 starter 디렉토리 추가로."""
+    import shutil
+
+    if name in ws.locals:
+        _fail(f"{name}: 이미 편집 표면에 등록됨")
+    dest = root / "repos" / name
+    if dest.exists():
+        _fail(f"{name}: 경로 이미 존재 — {dest}")
+    starter = wsm.core_infra_dir(ws, root) / "starter" / "default"
+    if not starter.is_dir():
+        _fail(f"starter 없음: {starter} — core-infra/starter/default 확인")
+    shutil.copytree(starter, dest)
+    for f in dest.rglob("*"):
+        if f.is_file():
+            try:
+                f.write_text(f.read_text(encoding="utf-8").replace("__MODULE__", name), encoding="utf-8")
+            except UnicodeDecodeError:
+                pass  # 바이너리는 치환 대상 아님
+    _ok(f"{name}: starter 복사 + 치환 → {dest}")
+    kube.run(["git", "-C", str(dest), "init", "-q"])
+    kube.run(["git", "-C", str(dest), "add", "-A"])
+    kube.run(["git", "-C", str(dest), "commit", "-q", "-m", f"init: {name} — bee new (starter)"])
+    ws.locals[name] = wsm.LocalOverride(name=name, path=Path("repos") / name)
+    wsm.save_workspace(root, ws)
+    _ok(f"{name}: git init + 워크스페이스 등록 — 소스=멤버십(규칙 5)")
+    typer.secho(f"  다음: bee render {name} · bee up {name} · 리모트는 gh repo create 후 push", dim=True)
+
+
 # ── 커맨드 ────────────────────────────────────────────────────────────────────
 @app.command()
 def render(
@@ -364,15 +407,15 @@ def render(
 ):
     """모듈 렌더 — 파생은 chart 가(규칙 1), CLI 는 helm template 위임만."""
     root, ws = load_ctx()
-    chart = chart_path if chart_path else wsm.chart_dir(ws, root)
+    chart = chart_path if chart_path else _chart_source(ws, root)
     overrides = wsm.override_dirs(ws, root)
     if module not in overrides:
         known = ", ".join(sorted(overrides)) or "(없음)"
         _fail(f"모듈 없음: {module!r} — 워크스페이스 local 등록이 멤버십이다(규칙 5). 등록됨: {known}")
     mdir = overrides[module]
-    _chart_warnings(mdir / "module.yaml", Path(chart), wsm.platform_yaml_path(ws, root))
+    _chart_warnings(mdir / "module.yaml", chart, wsm.platform_yaml_path(ws, root))
     ns = _namespace(module, _yaml_at(mdir / "module.yaml"), _products(ws, root))
-    sys.stdout.write(_render(Path(chart), mdir, env, module, set_values=(f"namespace={ns}",)))
+    sys.stdout.write(_render(chart, mdir, env, module, set_values=(f"namespace={ns}",)))
 
 
 @app.command()
@@ -413,6 +456,13 @@ def publish(
     """스냅샷 레포 커밋 — 이미지 push 는 build/CI 몫(분리). 검증은 CI 게이트1(규칙 2)."""
     root, ws = load_ctx()
     publish_impl(env, list(modules) if modules else None, root, ws, digest=digest, push=push)
+
+
+@app.command()
+def new(name: str = typer.Argument(..., help="신규 모듈 이름")):
+    """신규 모듈 — starter 복사 + 이름 치환 + 워크스페이스 등록(G5). pull 의 쌍둥이(신규 진입)."""
+    root, ws = load_ctx()
+    new_impl(name, root, ws)
 
 
 @app.command()
