@@ -208,6 +208,9 @@ def up_impl(roots: list[str] | None, root: Path, ws: wsm.Workspace, *, no_build:
     chart = wsm.chart_dir(ws, root)
     pyaml = wsm.platform_yaml_path(ws, root)
     for name in res.order:
+        if name not in overrides and name not in snaps:
+            continue  # missing 은 plan 에서 이미 경고
+        ns = _namespace(name, _module_data(name, overrides, snaps), products)
         if name in overrides:
             mdir = overrides[name]
             if not no_build:
@@ -215,13 +218,10 @@ def up_impl(roots: list[str] | None, root: Path, ws: wsm.Workspace, *, no_build:
                 kube.docker_build(tag, mdir)
                 kube.kind_load(tag, ctx.removeprefix("kind-"))
             _chart_warnings(mdir / "module.yaml", chart, pyaml)
-            manifests, src = _render(chart, mdir, "local", name), "local"
-        elif name in snaps:
+            manifests, src = _render(chart, mdir, "local", name, set_values=(f"namespace={ns}",)), "local"
+        else:
             sm = snaps[name]
             manifests, src = "\n---\n".join(p.read_text(encoding="utf-8") for p in sm.manifests), "snapshot"
-        else:
-            continue  # missing 은 plan 에서 이미 경고
-        ns = _namespace(name, _module_data(name, overrides, snaps), products)
         kube.ensure_namespace(ctx, ns)
         kube.apply(ctx, ns, manifests)
         _ok(f"{name} ({src}) → apply -n {ns}")
@@ -235,13 +235,13 @@ def down_impl(root: Path, ws: wsm.Workspace, *, remote_ok: bool = False) -> None
     products = _products(ws, root)
     chart = wsm.chart_dir(ws, root)
     for name in reversed(res.order):  # 의존 역순으로 내림
-        if name in overrides:
-            manifests = _render(chart, overrides[name], "local", name)
-        elif name in snaps:
-            manifests = "\n---\n".join(p.read_text(encoding="utf-8") for p in snaps[name].manifests)
-        else:
+        if name not in overrides and name not in snaps:
             continue
         ns = _namespace(name, _module_data(name, overrides, snaps), products)
+        if name in overrides:
+            manifests = _render(chart, overrides[name], "local", name, set_values=(f"namespace={ns}",))
+        else:
+            manifests = "\n---\n".join(p.read_text(encoding="utf-8") for p in snaps[name].manifests)
         kube.delete(ctx, ns, manifests)
         _ok(f"{name} → delete (워크로드만 — ns·데이터 보존, 규칙 9)")
 
@@ -288,12 +288,14 @@ def publish_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Worksp
         _fail("--digest 는 모듈 1개와 함께만 사용한다 (모듈별 digest 가 다르다)")
     chart = wsm.chart_dir(ws, root)
     pyaml = wsm.platform_yaml_path(ws, root)
+    products = _products(ws, root)
     snap_path = _snapshot_path(root, ws)
     env_dir = snap_path / "envs" / env
     for name in names:
         mdir = overrides[name]
         _chart_warnings(mdir / "module.yaml", chart, pyaml)
-        sets = (f"imageDigest={digest}",) if digest else ()
+        ns = _namespace(name, _yaml_at(mdir / "module.yaml"), products)
+        sets = (f"namespace={ns}",) + ((f"imageDigest={digest}",) if digest else ())
         manifests = _render(chart, mdir, env, name, set_values=sets)
         spec = _yaml_at(mdir / "module.yaml").get("spec") or {}
         prov = {
@@ -369,7 +371,8 @@ def render(
         _fail(f"모듈 없음: {module!r} — 워크스페이스 local 등록이 멤버십이다(규칙 5). 등록됨: {known}")
     mdir = overrides[module]
     _chart_warnings(mdir / "module.yaml", Path(chart), wsm.platform_yaml_path(ws, root))
-    sys.stdout.write(_render(Path(chart), mdir, env, module))
+    ns = _namespace(module, _yaml_at(mdir / "module.yaml"), _products(ws, root))
+    sys.stdout.write(_render(Path(chart), mdir, env, module, set_values=(f"namespace={ns}",)))
 
 
 @app.command()
