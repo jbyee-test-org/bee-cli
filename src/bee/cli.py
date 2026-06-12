@@ -318,6 +318,39 @@ def publish_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Worksp
         _ok("snapshot push — 적용은 CD(ArgoCD)의 몫(G5: CLI 의 공유환경 출력은 git 까지)")
 
 
+def pull_impl(modules: list[str], root: Path, ws: wsm.Workspace) -> None:
+    """스냅샷(backdrop) 모듈 → 편집 표면: clone(provenance.repoUrl) + 워크스페이스 등록.
+
+    멤버십 변경이 전부(규칙 5) — derive 0. 목적지 `repos/<name>` 가 이미 있으면
+    clone 생략(멱등)하고 등록만 한다. URL 출처 = provenance(G8 카탈로그 통합).
+    """
+    env_dir = wsm.resolve_snapshot_env_dir(ws, root)
+    snaps = snap_mod.load_snapshot(env_dir)
+    changed = False
+    for name in modules:
+        if name in ws.locals:
+            _warn(f"{name}: 이미 편집 표면(from-local) — 건너뜀")
+            continue
+        if name not in snaps:
+            _fail(f"{name}: 스냅샷(envs/{ws.env})에 없음 — pull 대상은 backdrop 모듈")
+        dest = root / "repos" / name
+        if dest.exists():
+            typer.secho(f"  {name}: 경로 존재 — clone 생략(멱등), 등록만: {dest}", dim=True)
+        else:
+            sm = snaps[name]
+            url = (_yaml_at(sm.provenance).get("repoUrl") or "") if sm.provenance else ""
+            if not url.startswith(("http", "git@")):
+                _fail(f"{name}: provenance.repoUrl 없음/비원격({url!r}) — clone 불가")
+            kube.run(["git", "clone", "--quiet", url, str(dest)])
+            _ok(f"{name}: clone {url} → {dest}")
+        ws.locals[name] = wsm.LocalOverride(name=name, path=Path("repos") / name)
+        changed = True
+        _ok(f"{name}: 워크스페이스 local: 등록 — 소스=멤버십(규칙 5), 이제 from-local")
+    if changed:
+        wsm.save_workspace(root, ws)
+        typer.secho("  (bee.workspace.yaml 갱신 — 등록 해제는 local: 항목 제거)", dim=True)
+
+
 # ── 커맨드 ────────────────────────────────────────────────────────────────────
 @app.command()
 def render(
@@ -377,6 +410,13 @@ def publish(
     """스냅샷 레포 커밋 — 이미지 push 는 build/CI 몫(분리). 검증은 CI 게이트1(규칙 2)."""
     root, ws = load_ctx()
     publish_impl(env, list(modules) if modules else None, root, ws, digest=digest, push=push)
+
+
+@app.command()
+def pull(modules: list[str] = typer.Argument(..., help="스냅샷(backdrop) 모듈 → 편집 표면")):
+    """스냅샷 모듈을 편집 표면으로 — clone(provenance.repoUrl) + 워크스페이스 등록(규칙 5)."""
+    root, ws = load_ctx()
+    pull_impl(list(modules), root, ws)
 
 
 @app.command()

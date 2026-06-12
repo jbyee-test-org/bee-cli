@@ -213,8 +213,15 @@ def _fallback_repl(root: Path):
                 _fb_down(m)
             elif ch == "status":
                 cli.status_impl(root, ws)
-            elif ch in ("publish", "pull"):
-                typer.echo("  " + s(f"{ch}: Phase 2 마일스톤 — 아직 없음", dim=True))
+            elif ch == "publish":
+                names = sorted(m.overrides)
+                if names and confirm(f"bee publish dev {' '.join(names)}"):
+                    cli.publish_impl("dev", names, root, ws)
+            elif ch == "pull":
+                items = [(n, "from-snapshot", "", "snap") for n in m.backdrop]
+                sel = sorted(_checklist_numbered("pull ▸ backdrop → 편집 표면", items)) if items else []
+                if sel and confirm(f"bee pull {' '.join(sel)}"):
+                    cli.pull_impl(sel, root, ws)
             elif ch:
                 typer.echo("  " + s("? 모르는 액션: " + ch, dim=True))
         except typer.Exit:
@@ -277,8 +284,8 @@ class BeeApp(App[None]):
         Binding("space", "toggle_mark", "mark", key_display="␣"),
         Binding("a", "toggle_all", "all"),
         Binding("r", "reload", "refresh"),
-        Binding("p", "publish", "publish⁽²⁾"),
-        Binding("e", "pull", "pull⁽²⁾"),
+        Binding("p", "publish", "publish"),
+        Binding("e", "pull", "pull"),
         Binding("q", "quit", "quit"),
         Binding("j", "row_down", "down", show=False),
         Binding("k", "row_up", "up", show=False),
@@ -481,10 +488,40 @@ class BeeApp(App[None]):
         self.notify("오리엔트 갱신")
 
     def action_publish(self):
-        self.notify("publish: Phase 2 마일스톤 — 아직 없음", severity="information")
+        m = self.model
+        names = sorted(n for n in self._targets() if n in m.overrides) or sorted(m.overrides)
+        if not names:
+            self.notify("publish 는 편집 표면(from-local) 전용(규칙 5)", severity="warning")
+            return
+        body = "\n".join(f"[cyan]✎ {n}[/] [dim]렌더(values-dev) + 엔트리 + 스냅샷 커밋[/]" for n in names)
+        body += ("\n\n[dim]env=dev 고정(다른 env 는 CLI 플래그로 — 졸업 경로) · digest 미주입"
+                 " → 게이트1이 차단 · 무변경이면 커밋 생략(G8)[/]")
+        equiv = "bee publish dev " + " ".join(names)
+        self.push_screen(
+            ConfirmScreen("publish — 스냅샷 레포 커밋", body, equiv),
+            lambda ok: self._run_suspended(
+                equiv, lambda: cli.publish_impl("dev", names, self.root, self.ws)) if ok else None,
+        )
 
     def action_pull(self):
-        self.notify("pull: Phase 2 마일스톤 — 아직 없음", severity="information")
+        m = self.model
+        names = sorted(n for n in self._targets() if n in m.backdrop)
+        if not names:
+            self.notify("pull 대상은 backdrop(from-snapshot) 모듈 — 행을 선택", severity="warning")
+            return
+        lines = []
+        for n in names:
+            sm = m.snaps.get(n)
+            url = (cli._yaml_at(sm.provenance).get("repoUrl") or "?") if sm and sm.provenance else "?"
+            lines.append(f"[bright_black]· {n}[/] [dim]{url} → repos/{n}[/]")
+        lines.append("")
+        lines.append("[dim]clone + 워크스페이스 local: 등록 — 소스=멤버십(규칙 5), 편집 표면 진입[/]")
+        equiv = "bee pull " + " ".join(names)
+        self.push_screen(
+            ConfirmScreen("pull — 편집 시작 (backdrop → 편집 표면)", "\n".join(lines), equiv),
+            lambda ok: self._run_suspended(
+                equiv, lambda: cli.pull_impl(names, self.root, self.ws)) if ok else None,
+        )
 
     def on_data_table_row_selected(self, event):  # ⏎ = 커서 행 up (가이드 프롬프트 경유)
         self.action_do_up()
