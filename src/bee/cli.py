@@ -142,6 +142,23 @@ def _image_tag(mdir: Path) -> str:
     return f"{v.get('registry')}/{image}:{v.get('imageTag', 'local')}"
 
 
+def _migrations_cm(name: str, mdir: Path, ns: str) -> str | None:
+    """db.migrations SQL → ConfigMap 매니페스트 — kubectl --dry-run 위임(G14②, 변환 0)."""
+    db = (_yaml_at(mdir / "module.yaml").get("spec") or {}).get("db") or {}
+    mig = db.get("migrations")
+    if not mig:
+        return None
+    sql_dir = mdir / mig
+    if not sql_dir.is_dir():
+        _fail(f"{name}: 마이그레이션 디렉토리 없음 — {sql_dir}")
+    return kube.run(["kubectl", "create", "configmap", f"{name}-migrations", "-n", ns,
+                     f"--from-file={sql_dir}", "--dry-run=client", "-o", "yaml"]).stdout
+
+
+def _has_db(name: str, overrides: dict, snaps: dict) -> bool:
+    return bool((_module_data(name, overrides, snaps).get("spec") or {}).get("db"))
+
+
 def plan(ws: wsm.Workspace, root: Path, roots: list[str] | None = None):
     """locals+snapshot 병합 → 서브그래프(의존 먼저). 멤버십: local 이 이긴다(규칙 5·6·7)."""
     overrides = wsm.override_dirs(ws, root)
@@ -236,6 +253,13 @@ def up_impl(roots: list[str] | None, root: Path, ws: wsm.Workspace, *, no_build:
             sm = snaps[name]
             manifests, src = "\n---\n".join(p.read_text(encoding="utf-8") for p in sm.manifests), "snapshot"
         kube.ensure_namespace(ctx, ns)
+        if _has_db(name, overrides, snaps):  # Job 은 불변 필드 — 재적용 전 교체(G14)
+            kube.run(["kubectl", "--context", ctx, "-n", ns, "delete", "job",
+                      f"{name}-migrate", "--ignore-not-found"])
+        if name in overrides:
+            cm = _migrations_cm(name, overrides[name], ns)
+            if cm:
+                kube.apply(ctx, ns, cm)
         kube.apply(ctx, ns, manifests)
         _ok(f"{name} ({src}) → apply -n {ns}")
     commit = _write_lock(root, ws, overrides)
@@ -319,7 +343,12 @@ def publish_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Worksp
             "chartVersion": str((spec.get("chart") or {}).get("version") or ""),
             "dependsOn": list(spec.get("dependsOn") or []),
         }
-        snap_mod.write_entry(env_dir, name, mdir / "module.yaml", manifests, provenance=prov)
+        cm = _migrations_cm(name, mdir, ns)
+        if cm:
+            manifests = manifests + "\n---\n" + cm
+        db_dir = mdir / "db"
+        snap_mod.write_entry(env_dir, name, mdir / "module.yaml", manifests, provenance=prov,
+                             db_src=db_dir if db_dir.is_dir() else None)
         _ok(f"{name} → envs/{env}/{name}  "
             + ("(digest pin)" if digest else "(digest 없음 — 게이트1이 차단한다)"))
     kube.run(["git", "-C", str(snap_path), "add", f"envs/{env}"])
