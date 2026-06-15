@@ -7,6 +7,7 @@ CLI 에 derive/gate 를 추가하지 마라.
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
 from pathlib import Path
@@ -162,6 +163,25 @@ def _has_db(name: str, overrides: dict, snaps: dict) -> bool:
     return bool((_module_data(name, overrides, snaps).get("spec") or {}).get("db"))
 
 
+def _migrations_hash(mdir: Path) -> str:
+    """마이그레이션 페이로드 content-hash[:12] (G18②) — Flyway Job 이름 접미사가 되어
+    **내용 변경 시에만** 재실행을 트리거(무변경=같은 해시=no-op, 재실행 루프 없음).
+    입력: db spec(grants·schema 선언 포함) + SQL 파일 내용 + chart pin(템플릿 로직 변경 반영).
+    이건 파생이 아니라 좌표(migrationWave·namespace 동류) — 매니페스트는 차트가 만든다(규칙 1)."""
+    m = _yaml_at(mdir / "module.yaml")
+    db = (m.get("spec") or {}).get("db") or {}
+    h = hashlib.sha256()
+    h.update(yaml.safe_dump(db, sort_keys=True, allow_unicode=True).encode("utf-8"))
+    h.update((_pin(mdir) or "").encode("utf-8"))  # chart pin — 템플릿(grants 파생) 변경도 재실행
+    mig = db.get("migrations")
+    if mig and (mdir / mig).is_dir():
+        for f in sorted((mdir / mig).rglob("*")):
+            if f.is_file():
+                h.update(f.relative_to(mdir / mig).as_posix().encode("utf-8"))
+                h.update(f.read_bytes())
+    return h.hexdigest()[:12]
+
+
 def _all_specs(overrides: dict[str, Path], snaps: dict) -> dict[str, "resolver.ModuleSpec"]:
     """local + snapshot 의 전체 module spec — depth 계산용 그래프."""
     specs: dict = {}
@@ -177,6 +197,32 @@ def _migration_wave(name: str, specs: dict) -> int:
     """의존성 깊이 → 음수 migrationWave (-100 + depth). 앱(wave 0) 보다 먼저,
     Ingress health 게이트와 무관. deps-first(의존 모듈 먼저)를 ArgoCD sync-wave 로(G14③)."""
     return -100 + resolver.depth(specs, name)
+
+
+def _grant_warnings(name: str, overrides: dict[str, Path], snaps: dict) -> None:
+    """cross-schema grant 의 owner(db.schema)가 dependsOn-폐포에 없으면 경고(G18①ⓘ 불변식).
+
+    불변식: grant 대상 schema 는 자기 또는 dependsOn-조상이 소유(db.schema 선언)해야 한다.
+    그래야 음수 wave 의 deps-first 가 owner 의 CREATE→member 의 GRANT 순서를 보장 —
+    즉 **module-granular 순서로 충분**(전역 V-합집합 불필요, G14③). 위반은 grant Job 이
+    schema 부재로 실패한다. 차단이 아니라 경고(규칙 2 — 하드 게이트는 CI 의 env-wide 체크)."""
+    db = (_module_data(name, overrides, snaps).get("spec") or {}).get("db") or {}
+    grants = db.get("grants") or []
+    if not grants:
+        return
+    specs = _all_specs(overrides, snaps)
+    closure = resolver._reachable(specs, name)  # 자기 + dependsOn 조상
+    owned = {
+        s for n in closure if n in overrides or n in snaps
+        for s in [((_module_data(n, overrides, snaps).get("spec") or {}).get("db") or {}).get("schema")]
+        if s
+    }
+    for g in grants:
+        s = g.get("schema")
+        if s and s not in owned:
+            _warn(f"{name}: grant schema {s!r} 의 owner(db.schema)가 dependsOn-폐포에 없음 — "
+                  f"소유 모듈이 `db.schema: {s}` 를 선언하고 dependsOn 에 두라(G18① 불변식). "
+                  f"미충족 시 grant Job 이 schema 부재로 실패. 차단은 CI.")
 
 
 def plan(ws: wsm.Workspace, root: Path, roots: list[str] | None = None):
@@ -261,6 +307,7 @@ def up_impl(roots: list[str] | None, root: Path, ws: wsm.Workspace, *, no_build:
         if name not in overrides and name not in snaps:
             continue  # missing 은 plan 에서 이미 경고
         ns = _namespace(name, _module_data(name, overrides, snaps), products)
+        mig_hash: str | None = None
         if name in overrides:
             mdir = overrides[name]
             if not no_build:
@@ -270,20 +317,24 @@ def up_impl(roots: list[str] | None, root: Path, ws: wsm.Workspace, *, no_build:
             _chart_warnings(mdir / "module.yaml", chart, pyaml)
             sets = (f"namespace={ns}",)
             if _has_db(name, overrides, snaps):
-                sets += (f"migrationWave={_migration_wave(name, _all_specs(overrides, snaps))}",)
+                mig_hash = _migrations_hash(mdir)
+                sets += (f"migrationWave={_migration_wave(name, _all_specs(overrides, snaps))}",
+                         f"dbMigrationsHash={mig_hash}")
+                _grant_warnings(name, overrides, snaps)
             manifests, src = _render(chart, mdir, "local", name, set_values=sets), "local"
         else:
             sm = snaps[name]
             manifests, src = "\n---\n".join(p.read_text(encoding="utf-8") for p in sm.manifests), "snapshot"
         kube.ensure_namespace(ctx, ns)
-        if _has_db(name, overrides, snaps):  # Job 은 불변 필드 — 재적용 전 교체(G14)
-            kube.run(["kubectl", "--context", ctx, "-n", ns, "delete", "job",
-                      f"{name}-migrate", "--ignore-not-found"])
         if name in overrides:
             cm = _migrations_cm(name, overrides[name], ns)
             if cm:
                 kube.apply(ctx, ns, cm)
         kube.apply(ctx, ns, manifests)
+        if mig_hash:  # 스테일 해시 Job prune — 내용 변경 시 옛 Job 제거(현 해시 Job 은 보존, G18②).
+            kube.run(["kubectl", "--context", ctx, "-n", ns, "delete", "job",
+                      "-l", f"bee.dev/module={name},bee.dev/mighash!={mig_hash}",
+                      "--ignore-not-found"])
         _ok(f"{name} ({src}) → apply -n {ns}")
     commit = _write_lock(root, ws, overrides)
     typer.echo(f"  pin: snapshot@{commit[:7] or '(없음)'} → {wsm.LOCK_FILE}")
@@ -358,7 +409,9 @@ def publish_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Worksp
         ns = _namespace(name, _yaml_at(mdir / "module.yaml"), products)
         sets = (f"namespace={ns}",) + ((f"imageDigest={digest}",) if digest else ())
         if (_yaml_at(mdir / "module.yaml").get("spec") or {}).get("db"):
-            sets += (f"migrationWave={_migration_wave(name, _all_specs({name: mdir}, snaps))}",)
+            sets += (f"migrationWave={_migration_wave(name, _all_specs({name: mdir}, snaps))}",
+                     f"dbMigrationsHash={_migrations_hash(mdir)}")
+            _grant_warnings(name, {name: mdir}, snaps)
         manifests = _render(chart, mdir, env, name, set_values=sets)
         spec = _yaml_at(mdir / "module.yaml").get("spec") or {}
         prov = {
