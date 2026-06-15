@@ -350,6 +350,7 @@ def publish_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Worksp
     products = _products(ws, root)
     snap_path = _snapshot_path(root, ws)
     env_dir = snap_path / "envs" / env
+    snaps = snap_mod.load_snapshot(env_dir)  # depth 그래프 = 스냅샷의 의존 모듈 + 이번 모듈
     for name in names:
         mdir = overrides[name]
         _chart_warnings(mdir / "module.yaml", chart, pyaml)
