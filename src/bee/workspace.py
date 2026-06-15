@@ -128,11 +128,37 @@ def load_workspace(root: Path) -> Workspace:
     return Workspace.from_dict(yaml.safe_load(f.read_text(encoding="utf-8")) or {})
 
 
+def _merge_into(dst: dict, src: dict) -> None:
+    """src 값을 dst 에 머지 — dst(round-trip 로드)의 주석·순서·flow 스타일 보존.
+    dst 에만 있는 키는 제거(예: local 등록 해제). 매핑은 재귀, 그 외는 치환."""
+    for k in [k for k in dst if k not in src]:
+        del dst[k]
+    for k, v in src.items():
+        if isinstance(v, dict) and isinstance(dst.get(k), dict):
+            _merge_into(dst[k], v)
+        else:
+            dst[k] = v
+
+
 def save_workspace(root: Path, ws: Workspace) -> Path:
+    """기존 파일을 ruamel round-trip 으로 읽어 변경분만 머지 — 사용자 주석 보존(미결 6/G16).
+    pull·new 의 변경은 사실상 local: 항목 추가뿐이므로 그 외 라인의 주석은 그대로 남는다."""
+    from io import StringIO
+
+    from ruamel.yaml import YAML
+
     f = root / WORKSPACE_FILE
-    f.write_text(
-        yaml.safe_dump(ws.to_dict(), sort_keys=False, allow_unicode=True), encoding="utf-8"
-    )
+    new = ws.to_dict()
+    rt = YAML()
+    rt.indent(mapping=2, sequence=4, offset=2)
+    if f.exists():
+        doc = rt.load(f.read_text(encoding="utf-8")) or {}
+        _merge_into(doc, new)
+    else:
+        doc = new
+    buf = StringIO()
+    rt.dump(doc, buf)
+    f.write_text(buf.getvalue(), encoding="utf-8")
     return f
 
 
