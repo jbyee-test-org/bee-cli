@@ -27,6 +27,10 @@ app = typer.Typer(
 
 OK, ERR, WARN = typer.colors.GREEN, typer.colors.RED, typer.colors.YELLOW
 
+# substrate(infra) 서브커맨드 — 적용·점검(G26). doctor 처럼 setup/preflight 성격(REPL 비결선).
+substrate_app = typer.Typer(no_args_is_help=True, help="substrate(infra) 적용 — 정적+helm 위임(G26)")
+app.add_typer(substrate_app, name="substrate")
+
 
 @app.callback(invoke_without_command=True)
 def main(
@@ -365,6 +369,44 @@ def down_impl(root: Path, ws: wsm.Workspace, *, remote_ok: bool = False) -> None
         _ok(f"{name} → delete (워크로드만 — ns·데이터 보존, 규칙 9)")
 
 
+def substrate_up_impl(root: Path, ws: wsm.Workspace, *, remote_ok: bool = False) -> None:
+    """substrate 적용(G26) — 인너루프 클러스터에 공유 인프라를 올린다.
+
+    정적 매니페스트(core-infra/substrate/)는 kubectl apply, helm-패키지(Kong)는 helm
+    upgrade --install(substrate.helm.yaml 좌표) 위임. **합성 0**(G12③ sharpen: 합성만
+    금지 — 적용·검증은 허용. helm/kubectl 이 다 한다, bee 는 derive 0). 공유환경 substrate 는
+    여기서 안 한다 — ArgoCD bee-substrate-<env> 독점(G7·G12③). 멱등(반복 안전)."""
+    ctx = _cluster(ws, remote_ok)
+    ci = wsm.core_infra_dir(ws, root)
+    sub = ci / "substrate"
+    if not sub.is_dir():
+        _fail(f"substrate 디렉토리 없음 — {sub}")
+
+    # 1. 정적 매니페스트(ns·postgres·nats·nack). server-side: NACK CRD 가 client-side annotation 한도 초과.
+    typer.secho(f"substrate 정적 적용 → kubectl apply -R (ctx={ctx})", bold=True)
+    out = kube.run(["kubectl", "--context", ctx, "apply", "--server-side", "--force-conflicts",
+                    "-R", "-f", str(sub)]).stdout
+    for ln in out.splitlines():
+        typer.secho(f"  {ln}", dim=True)
+
+    # 2. helm-패키지 substrate(Kong 등) — substrate.helm.yaml 좌표 위임. upgrade --install = 멱등.
+    helm_decl = ci / "substrate.helm.yaml"
+    releases = (_yaml_at(helm_decl).get("releases") or []) if helm_decl.exists() else []
+    for rel in releases:
+        name = rel.get("name")
+        repon = rel.get("repoName") or name
+        chart, ver, ns = rel.get("chart"), rel.get("version"), rel.get("namespace") or name
+        typer.secho(f"substrate helm 적용 → {name} ({repon}/{chart}@{ver}, ns={ns})", bold=True)
+        if rel.get("repo"):
+            kube.run(["helm", "repo", "add", repon, rel["repo"]], check=False)   # 멱등
+            kube.run(["helm", "repo", "update", repon], check=False)
+        kube.run(["helm", "--kube-context", ctx, "upgrade", "--install", name,
+                  f"{repon}/{chart}", "--version", str(ver), "-n", ns, "--create-namespace"])
+        typer.secho(f"  {name} 적용 완료", dim=True)
+
+    _ok("substrate 적용 완료 — `bee doctor` 로 점검")
+
+
 def status_impl(root: Path, ws: wsm.Workspace) -> None:
     lock_f = root / wsm.LOCK_FILE
     if not lock_f.exists():
@@ -515,9 +557,10 @@ def new_impl(name: str, root: Path, ws: wsm.Workspace) -> None:
 
 
 def doctor_impl(*, remote_ok: bool = False) -> int:
-    """환경 진단(읽기 전용) — 도구·바인딩·클러스터 도달·pin 정합. **게이트 아님**(규칙 2):
+    """환경 진단(읽기 전용) — 도구·바인딩·클러스터 도달·substrate·pin 정합. **게이트 아님**(규칙 2):
     모듈 계약 검증은 CI·helm 몫. 여기는 '내 환경이 제대로 엮였나'의 프리플라이트.
-    substrate 는 CLI 무관여(G12③)라 점검하지 않는다. 반환 = ✗(fail) 개수."""
+    substrate 점검(G26 — G12③ sharpen: 합성만 금지, 검증·적용은 허용): 존재·도달만 read-only
+    확인(적용은 `bee substrate up`, 합성은 안 함). 반환 = ✗(fail) 개수."""
     import shutil
 
     tally = {"ok": 0, "warn": 0, "fail": 0}
@@ -612,7 +655,33 @@ def doctor_impl(*, remote_ok: bool = False) -> int:
         else:
             rep("fail", f"도달 불가 — {r.stderr.strip().splitlines()[0][:60] if r.stderr.strip() else 'context 없음?'}")
 
-    # 4. pin 정합 (G6 — 경고만, 차단은 CI)
+    # 4. substrate (G26 — read-only 점검만; 적용=bee substrate up, 합성은 안 함 G12③ sharpen)
+    typer.secho("\nsubstrate (인너루프 — read-only; 적용은 `bee substrate up`)", bold=True)
+    if not ctx:
+        rep("warn", "cluster.context 없음 — substrate 점검 생략")
+    else:
+        def _chk(args: list[str]) -> bool:
+            return kube.run(["kubectl", "--context", ctx, *args], check=False).returncode == 0
+        # postgres·nats = bee-substrate ns Deployment / NACK = CRD(cluster-scoped) / Kong = ingressclass
+        for ns, dep, label in [("bee-substrate", "postgres", "postgres"), ("bee-substrate", "nats", "NATS")]:
+            r = kube.run(["kubectl", "--context", ctx, "-n", ns, "get", "deploy", dep,
+                          "-o", "jsonpath={.status.readyReplicas}"], check=False)
+            if r.returncode != 0:
+                rep("warn", f"{label} 없음(ns {ns}/{dep}) — `bee substrate up` 필요")
+            elif (r.stdout.strip() or "0") != "0":
+                rep("ok", f"{label} Ready (ns {ns})")
+            else:
+                rep("warn", f"{label} Not Ready (ns {ns})")
+        nack = _chk(["get", "crd", "streams.jetstream.nats.io"])
+        rep("ok" if nack else "warn",
+            "NACK CRD (streams.jetstream.nats.io)" if nack
+            else "NACK CRD 없음 — events 어휘(Stream/Consumer) 적용 불가, `bee substrate up` 필요")
+        kong = _chk(["get", "ingressclass", "kong"])
+        rep("ok" if kong else "warn",
+            "Kong ingressclass" if kong
+            else "Kong 없음 — routing 어휘(Ingress) 적용 불가, `bee substrate up` 필요")
+
+    # 5. pin 정합 (G6 — 경고만, 차단은 CI)
     typer.secho("\npin 정합 (G6 — 경고만, 차단은 CI)", bold=True)
     pyaml = None
     try:
@@ -745,6 +814,16 @@ def doctor(
     모듈 계약 검증은 CI·helm 몫. ✗ 가 있으면 종료코드 1."""
     fails = doctor_impl(remote_ok=remote_ok)
     raise typer.Exit(1 if fails else 0)
+
+
+@substrate_app.command("up")
+def substrate_up(
+    remote_ok: bool = typer.Option(False, "--remote-ok", help="비-kind 컨텍스트 허용(G7)"),
+):
+    """substrate 올림(G26) — core-infra/substrate(정적, kubectl) + substrate.helm.yaml(Kong, helm 위임).
+    인너루프 전용 — 공유환경은 ArgoCD bee-substrate-<env>(G7·G12③). 합성 0(적용만), 멱등."""
+    root, ws = load_ctx()
+    substrate_up_impl(root, ws, remote_ok=remote_ok)
 
 
 if __name__ == "__main__":
