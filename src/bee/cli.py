@@ -162,6 +162,22 @@ def _has_db(name: str, overrides: dict, snaps: dict) -> bool:
     return bool((_module_data(name, overrides, snaps).get("spec") or {}).get("db"))
 
 
+def _all_specs(overrides: dict[str, Path], snaps: dict) -> dict[str, "resolver.ModuleSpec"]:
+    """local + snapshot 의 전체 module spec — depth 계산용 그래프."""
+    specs: dict = {}
+    for n, sm in snaps.items():
+        s = resolver.load_module_file(sm.module_yaml)
+        if s:
+            specs[n] = s
+    specs.update(resolver.load_modules(overrides))
+    return specs
+
+
+def _migration_wave(name: str, specs: dict) -> int:
+    """의존성 깊이 → migrationWave (1 + depth). deps-first 를 ArgoCD sync-wave 로(G14③)."""
+    return 1 + resolver.depth(specs, name)
+
+
 def plan(ws: wsm.Workspace, root: Path, roots: list[str] | None = None):
     """locals+snapshot 병합 → 서브그래프(의존 먼저). 멤버십: local 이 이긴다(규칙 5·6·7)."""
     overrides = wsm.override_dirs(ws, root)
@@ -251,7 +267,10 @@ def up_impl(roots: list[str] | None, root: Path, ws: wsm.Workspace, *, no_build:
                 kube.docker_build(tag, mdir)
                 kube.kind_load(tag, ctx.removeprefix("kind-"))
             _chart_warnings(mdir / "module.yaml", chart, pyaml)
-            manifests, src = _render(chart, mdir, "local", name, set_values=(f"namespace={ns}",)), "local"
+            sets = (f"namespace={ns}",)
+            if _has_db(name, overrides, snaps):
+                sets += (f"migrationWave={_migration_wave(name, _all_specs(overrides, snaps))}",)
+            manifests, src = _render(chart, mdir, "local", name, set_values=sets), "local"
         else:
             sm = snaps[name]
             manifests, src = "\n---\n".join(p.read_text(encoding="utf-8") for p in sm.manifests), "snapshot"
@@ -336,6 +355,8 @@ def publish_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Worksp
         _chart_warnings(mdir / "module.yaml", chart, pyaml)
         ns = _namespace(name, _yaml_at(mdir / "module.yaml"), products)
         sets = (f"namespace={ns}",) + ((f"imageDigest={digest}",) if digest else ())
+        if (_yaml_at(mdir / "module.yaml").get("spec") or {}).get("db"):
+            sets += (f"migrationWave={_migration_wave(name, _all_specs({name: mdir}, snaps))}",)
         manifests = _render(chart, mdir, env, name, set_values=sets)
         spec = _yaml_at(mdir / "module.yaml").get("spec") or {}
         prov = {

@@ -65,6 +65,25 @@ def load_modules(dirs: dict[str, Path]) -> dict[str, ModuleSpec]:
     return modules
 
 
+def depth(modules: dict[str, ModuleSpec], root: str) -> int:
+    """dependsOn 그래프에서 root 의 깊이 = 가장 긴 의존 체인(잎=0).
+
+    마이그레이션 순서(구 D10 + G14③ cross-module): 의존 모듈이 먼저 migrate 해야
+    cross-schema grant 가 성립한다. 깊이를 sync-wave 로 써서 deps-first 를 ArgoCD 에 전달.
+    """
+    seen: dict[str, int] = {}
+
+    def visit(n: str, stack: frozenset[str]) -> int:
+        if n in seen:
+            return seen[n]
+        deps = [d for d in modules[n].depends_on if d in modules and d not in stack] if n in modules else []
+        d = 0 if not deps else 1 + max(visit(x, stack | {n}) for x in deps)
+        seen[n] = d
+        return d
+
+    return visit(root, frozenset()) if root in modules else 0
+
+
 def _reachable(modules: dict[str, ModuleSpec], root: str) -> set[str]:
     """root 에서 dependsOn 을 따라 도달 가능한 노드(자기 자신 포함)."""
     seen: set[str] = set()
