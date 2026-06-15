@@ -153,11 +153,9 @@ def _migrations_cm(name: str, mdir: Path, ns: str) -> str | None:
         _fail(f"{name}: 마이그레이션 디렉토리 없음 — {sql_dir}")
     cm = kube.run(["kubectl", "create", "configmap", f"{name}-migrations", "-n", ns,
                    f"--from-file={sql_dir}", "--dry-run=client", "-o", "yaml"]).stdout
-    # PreSync Job 이 마운트하므로 CM 도 PreSync(wave -1) — kubectl annotate 위임 체인(변환 0)
+    # Flyway Job(wave 1)이 마운트하므로 CM 은 wave 0 — kubectl annotate 위임(변환 0)
     return kube.run(["kubectl", "annotate", "--local", "-f", "-", "-o", "yaml",
-                     "argocd.argoproj.io/hook=PreSync", "argocd.argoproj.io/sync-wave=-1",
-                     "argocd.argoproj.io/hook-delete-policy=BeforeHookCreation"],
-                    input_text=cm).stdout
+                     "argocd.argoproj.io/sync-wave=0"], input_text=cm).stdout
 
 
 def _has_db(name: str, overrides: dict, snaps: dict) -> bool:
