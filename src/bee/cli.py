@@ -143,6 +143,11 @@ def _image_tag(mdir: Path) -> str:
     return f"{v.get('registry')}/{image}:{v.get('imageTag', 'local')}"
 
 
+def _has_image(mdir: Path) -> bool:
+    """image 선언 여부. 없으면 workload 없는 schema 모듈(G21) — build·Deployment 생략."""
+    return bool(((_yaml_at(mdir / "module.yaml").get("spec") or {}).get("image") or {}).get("name"))
+
+
 def _migrations_cm(name: str, mdir: Path, ns: str) -> str | None:
     """db.migrations SQL → ConfigMap 매니페스트 — kubectl --dry-run 위임(G14②, 변환 0)."""
     db = (_yaml_at(mdir / "module.yaml").get("spec") or {}).get("db") or {}
@@ -290,6 +295,9 @@ def build_impl(names: list[str], root: Path, ws: wsm.Workspace) -> None:
     for name in names:
         if name not in overrides:
             _fail(f"{name!r} 는 from-local 이 아니다 — build 는 편집 표면 전용(규칙 5)")
+        if not _has_image(overrides[name]):
+            typer.secho(f"  {name}: image 없음 — schema 모듈(G21), build 생략", dim=True)
+            continue
         tag = _image_tag(overrides[name])
         kube.docker_build(tag, overrides[name])
         kube.kind_load(tag, cluster)
@@ -310,7 +318,7 @@ def up_impl(roots: list[str] | None, root: Path, ws: wsm.Workspace, *, no_build:
         mig_hash: str | None = None
         if name in overrides:
             mdir = overrides[name]
-            if not no_build:
+            if not no_build and _has_image(mdir):   # image 없으면 schema 모듈(G21) — build 생략
                 tag = _image_tag(mdir)
                 kube.docker_build(tag, mdir)
                 kube.kind_load(tag, ctx.removeprefix("kind-"))
@@ -429,7 +437,9 @@ def publish_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Worksp
         snap_mod.write_entry(env_dir, name, mdir / "module.yaml", manifests, provenance=prov,
                              db_src=db_dir if db_dir.is_dir() else None)
         _ok(f"{name} → envs/{env}/{name}  "
-            + ("(digest pin)" if digest else "(digest 없음 — 게이트1이 차단한다)"))
+            + ("(digest pin)" if digest
+               else "(image 없음 — schema 모듈, G21)" if not _has_image(mdir)
+               else "(digest 없음 — 게이트1이 차단한다)"))
     kube.run(["git", "-C", str(snap_path), "add", f"envs/{env}"])
     if not kube.git(["status", "--porcelain", "--", f"envs/{env}"], snap_path):
         typer.secho("  무변경 — 커밋 생략 (diff = 실질 변경, G8)", dim=True)
