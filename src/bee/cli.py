@@ -153,9 +153,9 @@ def _migrations_cm(name: str, mdir: Path, ns: str) -> str | None:
         _fail(f"{name}: 마이그레이션 디렉토리 없음 — {sql_dir}")
     cm = kube.run(["kubectl", "create", "configmap", f"{name}-migrations", "-n", ns,
                    f"--from-file={sql_dir}", "--dry-run=client", "-o", "yaml"]).stdout
-    # Flyway Job(wave 1)이 마운트하므로 CM 은 wave 0 — kubectl annotate 위임(변환 0)
+    # Flyway Job(음수 wave)이 마운트하므로 CM 은 -200 — kubectl annotate 위임(변환 0)
     return kube.run(["kubectl", "annotate", "--local", "-f", "-", "-o", "yaml",
-                     "argocd.argoproj.io/sync-wave=0"], input_text=cm).stdout
+                     "argocd.argoproj.io/sync-wave=-200"], input_text=cm).stdout
 
 
 def _has_db(name: str, overrides: dict, snaps: dict) -> bool:
@@ -174,8 +174,9 @@ def _all_specs(overrides: dict[str, Path], snaps: dict) -> dict[str, "resolver.M
 
 
 def _migration_wave(name: str, specs: dict) -> int:
-    """의존성 깊이 → migrationWave (1 + depth). deps-first 를 ArgoCD sync-wave 로(G14③)."""
-    return 1 + resolver.depth(specs, name)
+    """의존성 깊이 → 음수 migrationWave (-100 + depth). 앱(wave 0) 보다 먼저,
+    Ingress health 게이트와 무관. deps-first(의존 모듈 먼저)를 ArgoCD sync-wave 로(G14③)."""
+    return -100 + resolver.depth(specs, name)
 
 
 def plan(ws: wsm.Workspace, root: Path, roots: list[str] | None = None):
