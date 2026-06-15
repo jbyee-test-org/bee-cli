@@ -308,6 +308,24 @@ def build_impl(names: list[str], root: Path, ws: wsm.Workspace) -> None:
         _ok(f"{name}: docker build → kind load ({tag})")
 
 
+def _apply_local_secrets(name: str, mdir: Path, ns: str, ctx: str) -> None:
+    """인너루프 secret 충족(G27) — `secrets.local.yaml`(gitignore) → {name}-secrets Secret apply.
+    아웃터는 ESO(ExternalSecret, env!=local). 이건 합성이 아니라 **적용**(kubectl create secret 위임,
+    G26 정신) — bee 는 로컬 값을 Secret 으로 깔 뿐 파생하지 않는다. 계약은 module.yaml 의 spec.secrets."""
+    f = mdir / "secrets.local.yaml"
+    if not f.exists():
+        return
+    data = _yaml_at(f)
+    if not data:
+        return
+    args = ["kubectl", "--context", ctx, "-n", ns, "create", "secret", "generic", f"{name}-secrets",
+            "--dry-run=client", "-o", "yaml"]
+    for k, v in data.items():
+        args.append(f"--from-literal={k}={v}")
+    kube.apply(ctx, ns, kube.run(args).stdout)
+    typer.secho(f"  {name}: 로컬 secret apply ({len(data)} keys, 인너루프 — 아웃터는 ESO)", dim=True)
+
+
 def up_impl(roots: list[str] | None, root: Path, ws: wsm.Workspace, *, no_build: bool = False,
             remote_ok: bool = False) -> None:
     ctx = _cluster(ws, remote_ok)
@@ -339,6 +357,7 @@ def up_impl(roots: list[str] | None, root: Path, ws: wsm.Workspace, *, no_build:
             manifests, src = "\n---\n".join(p.read_text(encoding="utf-8") for p in sm.manifests), "snapshot"
         kube.ensure_namespace(ctx, ns)
         if name in overrides:
+            _apply_local_secrets(name, overrides[name], ns, ctx)   # 인너루프 secret(G27) — 아웃터는 ESO
             cm = _migrations_cm(name, overrides[name], ns)
             if cm:
                 kube.apply(ctx, ns, cm)
