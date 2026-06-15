@@ -25,7 +25,7 @@ app = typer.Typer(
     help="bee — thin CLI. 단일 기준: GENESIS.md",
 )
 
-OK, ERR = typer.colors.GREEN, typer.colors.RED
+OK, ERR, WARN = typer.colors.GREEN, typer.colors.RED, typer.colors.YELLOW
 
 
 @app.callback(invoke_without_command=True)
@@ -504,6 +504,146 @@ def new_impl(name: str, root: Path, ws: wsm.Workspace) -> None:
     typer.secho(f"  다음: bee render {name} · bee up {name} · 리모트는 gh repo create 후 push", dim=True)
 
 
+def doctor_impl(*, remote_ok: bool = False) -> int:
+    """환경 진단(읽기 전용) — 도구·바인딩·클러스터 도달·pin 정합. **게이트 아님**(규칙 2):
+    모듈 계약 검증은 CI·helm 몫. 여기는 '내 환경이 제대로 엮였나'의 프리플라이트.
+    substrate 는 CLI 무관여(G12③)라 점검하지 않는다. 반환 = ✗(fail) 개수."""
+    import shutil
+
+    tally = {"ok": 0, "warn": 0, "fail": 0}
+
+    def rep(kind: str, msg: str) -> None:
+        sym, col = {"ok": ("✓", OK), "warn": ("⚠", WARN), "fail": ("✗", ERR)}[kind]
+        typer.secho(f"  {sym} {msg}", fg=col)
+        tally[kind] += 1
+
+    typer.secho("bee doctor — 환경 진단 (읽기 전용, 게이트 아님)\n", bold=True)
+
+    # 1. 도구
+    typer.secho("도구", bold=True)
+    for tool, args, required in [
+        ("helm", ["version", "--short"], True),
+        ("kubectl", ["version", "--client"], True),
+        ("docker", ["--version"], True),
+        ("git", ["--version"], True),
+        ("uv", ["--version"], False),
+    ]:
+        if not shutil.which(tool):
+            rep("fail" if required else "warn", f"{tool} 없음{'' if required else ' (선택)'}")
+            continue
+        out = kube.run([tool, *args], check=False).stdout.strip().splitlines()
+        rep("ok", f"{tool} {out[0][:46] if out else ''}".strip())
+
+    # 2. 워크스페이스 바인딩
+    typer.secho("\n워크스페이스", bold=True)
+    try:
+        root = wsm.find_root(Path.cwd())
+    except Exception as e:
+        rep("fail", f"bee.workspace.yaml 못 찾음 — {e}")
+        return _doctor_summary(tally)
+    try:
+        ws = wsm.load_workspace(root)
+        rep("ok", f"bee.workspace.yaml — env={ws.env}, platform={ws.platform or '-'}")
+    except Exception as e:
+        rep("fail", f"워크스페이스 파싱 실패 — {e}")
+        return _doctor_summary(tally)
+
+    try:
+        ci = wsm.core_infra_dir(ws, root)
+        if ws.chart_ref:
+            rep("ok", f"coreInfra: {ci} · chart=OCI {ws.chart_ref}")
+        else:
+            cv = _yaml_at(wsm.chart_dir(ws, root) / "Chart.yaml").get("version", "?")
+            rep("ok", f"coreInfra: {ci} · chart {cv} (path)")
+    except Exception as e:
+        rep("fail", f"coreInfra/chart — {e}")
+
+    try:
+        p = wsm.platform_yaml_path(ws, root)
+        if p:
+            sup = ((_yaml_at(p).get("spec") or {}).get("chart") or {}).get("supported", "?")
+            rep("ok", f"platform.yaml: {ws.platform} (supported {sup})")
+        else:
+            rep("warn", "platform 미선언 — namespace 룩업·지원 범위 검사 생략")
+    except Exception as e:
+        rep("fail", f"platform.yaml — {e}")
+
+    try:
+        sdir = wsm.resolve_snapshot_env_dir(ws, root)
+        snaps = snap_mod.load_snapshot(sdir)
+        rep("ok", f"snapshot: {sdir} ({len(snaps)} 모듈 backdrop)")
+    except Exception as e:
+        rep("fail", f"snapshot — {e}")
+
+    overrides: dict = {}
+    try:
+        overrides = wsm.override_dirs(ws, root)
+        if not overrides:
+            rep("warn", "편집 표면 비어있음 — local 에 모듈 등록(소스=멤버십, 규칙 5)")
+        for n, d in sorted(overrides.items()):
+            rep("ok", f"local: {n} → {d}")
+    except Exception as e:
+        rep("fail", f"local override — {e}")
+
+    # 3. 클러스터 (인너루프 직접 적용 대상)
+    typer.secho("\n클러스터", bold=True)
+    ctx = ws.cluster_context
+    if not ctx:
+        rep("fail", "cluster.context 없음 — bee.workspace.yaml")
+    else:
+        kind = ctx.startswith("kind-")
+        rep("ok" if kind else "warn",
+            f"cluster.context: {ctx} ({'kind' if kind else '비-kind — up/down 시 --remote-ok 필요(G7)'})")
+        r = kube.run(["kubectl", "--context", ctx, "get", "nodes", "--no-headers"], check=False)
+        if r.returncode == 0:
+            ready = sum(1 for ln in r.stdout.splitlines() if " Ready" in ln)
+            total = len([ln for ln in r.stdout.splitlines() if ln.strip()])
+            rep("ok" if ready == total and total else "warn", f"도달 가능 ({ready}/{total} 노드 Ready)")
+        else:
+            rep("fail", f"도달 불가 — {r.stderr.strip().splitlines()[0][:60] if r.stderr.strip() else 'context 없음?'}")
+
+    # 4. pin 정합 (G6 — 경고만, 차단은 CI)
+    typer.secho("\npin 정합 (G6 — 경고만, 차단은 CI)", bold=True)
+    pyaml = None
+    try:
+        pyaml = wsm.platform_yaml_path(ws, root)
+    except Exception:
+        pass
+    sup = ((_yaml_at(pyaml).get("spec") or {}).get("chart") or {}).get("supported") if pyaml else None
+    if not overrides:
+        rep("warn", "편집 표면 없음 — pin 점검 생략")
+    for n, d in sorted(overrides.items()):
+        pin = ((_yaml_at(d / "module.yaml").get("spec") or {}).get("chart") or {}).get("version")
+        if not pin:
+            rep("warn", f"{n}: chart pin 없음(module.yaml spec.chart.version)")
+            continue
+        if sup:
+            try:
+                from packaging.specifiers import SpecifierSet
+                from packaging.version import Version
+
+                spec = SpecifierSet(sup if "," in sup else sup.replace(" ", ","))
+                if Version(str(pin)) not in spec:
+                    rep("warn", f"{n}: chart pin {pin} ∉ supported {sup}")
+                    continue
+            except Exception:
+                pass
+        rep("ok", f"{n}: chart pin {pin}" + (f" ∈ {sup}" if sup else ""))
+
+    return _doctor_summary(tally)
+
+
+def _doctor_summary(tally: dict) -> int:
+    typer.secho(f"\n요약: ✓ {tally['ok']} · ⚠ {tally['warn']} · ✗ {tally['fail']}", bold=True)
+    if tally["fail"]:
+        typer.secho("환경에 막힌 곳이 있다 — 위 ✗ 를 먼저 풀어라.", fg=ERR)
+    elif tally["warn"]:
+        typer.secho("동작엔 지장 없으나 확인 권장(⚠).", fg=WARN)
+    else:
+        typer.secho("환경 정상 — bee up 준비됨.", fg=OK)
+    return tally["fail"]
+
+
 # ── 커맨드 ────────────────────────────────────────────────────────────────────
 @app.command()
 def render(
@@ -585,6 +725,16 @@ def status():
     """스냅샷 pin vs HEAD — 내 서브그래프 변경만 보고(규칙 8). 자동폴링 없음."""
     root, ws = load_ctx()
     status_impl(root, ws)
+
+
+@app.command()
+def doctor(
+    remote_ok: bool = typer.Option(False, "--remote-ok", help="비-kind 컨텍스트 허용(G7)"),
+):
+    """환경 진단 — 도구·바인딩·클러스터 도달·pin 정합(읽기 전용). 게이트 아님(규칙 2):
+    모듈 계약 검증은 CI·helm 몫. ✗ 가 있으면 종료코드 1."""
+    fails = doctor_impl(remote_ok=remote_ok)
+    raise typer.Exit(1 if fails else 0)
 
 
 if __name__ == "__main__":
