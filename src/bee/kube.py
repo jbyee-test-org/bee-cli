@@ -17,8 +17,14 @@ def run(cmd: list[str], *, input_text: str | None = None, check: bool = True) ->
     return r
 
 
-def docker_build(tag: str, context_dir: Path) -> None:
-    run(["docker", "build", "-q", "-t", tag, str(context_dir)])
+def docker_build(tag: str, context_dir: Path, secrets: tuple[tuple[str, str], ...] = ()) -> None:
+    """docker build. secrets=((id, env_var), …) → BuildKit `--mount=type=secret`(사설 registry 토큰 등,
+    G30). 토큰은 레이어에 안 박힘. docker 29 는 BuildKit 기본."""
+    cmd = ["docker", "build", "-q", "-t", tag]
+    for sid, senv in secrets:
+        cmd += ["--secret", f"id={sid},env={senv}"]
+    cmd.append(str(context_dir))
+    run(cmd)
 
 
 def kind_load(tag: str, cluster: str) -> None:

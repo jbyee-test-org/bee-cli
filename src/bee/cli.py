@@ -147,6 +147,15 @@ def _image_tag(mdir: Path) -> str:
     return f"{v.get('registry')}/{image}:{v.get('imageTag', 'local')}"
 
 
+def _build_secrets(ws: wsm.Workspace) -> tuple[tuple[str, str], ...]:
+    """워크스페이스 buildRegistries(G30) → docker BuildKit secret 인자 ((id, env_var), …).
+    id=`<name>_token` — Dockerfile 의 `--mount=type=secret,id=<name>_token` 과 매칭. 토큰은
+    tokenEnv 환경변수에서(레이어 미박힘). 미설정 registry 는 건너뜀(빌드는 빌더 책임 — bee 는 전달만)."""
+    return tuple((f"{r['name']}_token", r["tokenEnv"])
+                 for r in ws.build_registries
+                 if r.get("name") and r.get("tokenEnv"))
+
+
 def _has_image(mdir: Path) -> bool:
     """image 선언 여부. 없으면 workload 없는 schema 모듈(G21) — build·Deployment 생략."""
     return bool(((_yaml_at(mdir / "module.yaml").get("spec") or {}).get("image") or {}).get("name"))
@@ -303,7 +312,7 @@ def build_impl(names: list[str], root: Path, ws: wsm.Workspace) -> None:
             typer.secho(f"  {name}: image 없음 — schema 모듈(G21), build 생략", dim=True)
             continue
         tag = _image_tag(overrides[name])
-        kube.docker_build(tag, overrides[name])
+        kube.docker_build(tag, overrides[name], _build_secrets(ws))
         kube.kind_load(tag, cluster)
         _ok(f"{name}: docker build → kind load ({tag})")
 
@@ -342,7 +351,7 @@ def up_impl(roots: list[str] | None, root: Path, ws: wsm.Workspace, *, no_build:
             mdir = overrides[name]
             if not no_build and _has_image(mdir):   # image 없으면 schema 모듈(G21) — build 생략
                 tag = _image_tag(mdir)
-                kube.docker_build(tag, mdir)
+                kube.docker_build(tag, mdir, _build_secrets(ws))
                 kube.kind_load(tag, ctx.removeprefix("kind-"))
             _chart_warnings(mdir / "module.yaml", chart, pyaml)
             sets = (f"namespace={ns}",)
@@ -700,7 +709,23 @@ def doctor_impl(*, remote_ok: bool = False) -> int:
             "Kong ingressclass" if kong
             else "Kong 없음 — routing 어휘(Ingress) 적용 불가, `bee substrate up` 필요")
 
-    # 5. pin 정합 (G6 — 경고만, 차단은 CI)
+    # 5. build registry (G30 — 사설 registry 도달 + tokenEnv 점검. read-only · 빌드 프리플라이트)
+    if ws.build_registries:
+        import os
+        typer.secho("\nbuild registry (G30 — 빌드 사설 registry)", bold=True)
+        for r in ws.build_registries:
+            name, idx, tenv = r.get("name", "?"), r.get("index", ""), r.get("tokenEnv", "")
+            url = idx.replace("sparse+", "")
+            rc = kube.run(["curl", "-s", "-m", "6", "-o", "/dev/null", "-w", "%{http_code}", url],
+                          check=False).stdout.strip() if url else ""
+            reachable = bool(rc) and rc != "000"
+            rep("ok" if reachable else "warn",
+                f"{name}: 도달 {url or '(index 없음)'} (http {rc or '실패'})")
+            tok_set = bool(tenv) and bool(os.environ.get(tenv))
+            rep("ok" if tok_set else "warn",
+                f"{name}: 토큰 env ${tenv or '?'} " + ("설정됨" if tok_set else "미설정 — bee build 시 필요"))
+
+    # 6. pin 정합 (G6 — 경고만, 차단은 CI)
     typer.secho("\npin 정합 (G6 — 경고만, 차단은 CI)", bold=True)
     pyaml = None
     try:

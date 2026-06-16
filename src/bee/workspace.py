@@ -58,6 +58,10 @@ class Workspace:
     chart_ref: str | None = None         # oci://… — 있으면 OCI 소비(G6), 모듈 pin 이 --version
     cluster_context: str | None = None   # 인너루프 클러스터 kubectl 컨텍스트 (G7)
     locals: dict[str, LocalOverride] = field(default_factory=dict)
+    # 빌드 사설 registry(G30) — [{name, index, tokenEnv}]. bee build 가 token 을 BuildKit secret
+    # (id=<name>_token, env=tokenEnv)으로 주입 · doctor 가 도달+tokenEnv 점검. 빌드는 bee 경계 밖이나
+    # bee build 가 토큰을 *전달*(소유 아님 — secret mount)하므로 제네릭하게 선언받는다.
+    build_registries: list[dict] = field(default_factory=list)
 
     # ── 직렬화 ────────────────────────────────────────────────────────────────
     def to_dict(self) -> dict:
@@ -85,6 +89,8 @@ class Workspace:
             doc["coreInfra"] = ci
         if self.cluster_context:
             doc["cluster"] = {"context": self.cluster_context}
+        if self.build_registries:
+            doc["buildRegistries"] = self.build_registries
         doc["local"] = local_out
         return doc
 
@@ -110,6 +116,7 @@ class Workspace:
             chart_ref=ci.get("chartRef"),
             cluster_context=(data.get("cluster") or {}).get("context"),
             locals=locals_,
+            build_registries=list(data.get("buildRegistries") or []),
         )
 
 
