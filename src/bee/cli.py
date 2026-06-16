@@ -286,13 +286,11 @@ def _module_data(name: str, overrides: dict[str, Path], snaps: dict) -> dict:
 
 
 def _snapshot_path(root: Path, ws: wsm.Workspace) -> Path:
-    repo = ws.snapshot_repo or ""
-    if not repo:
-        _fail("snapshot 경로 필요: bee.workspace.yaml 의 snapshot.repo")
-    p = Path(repo) if Path(repo).is_absolute() else (root / repo)
-    if not p.exists():
-        _fail(f"snapshot 경로 없음(로컬만 지원, git URL 은 후속): {p}")
-    return p
+    """snapshot 레포 루트 — 로컬 경로 또는 원격 fetch 캐시(소비). lock 기록·publish 가 사용."""
+    try:
+        return wsm.snapshot_repo_dir(ws, root)
+    except wsm.WorkspaceError as e:
+        _fail(str(e))
 
 
 def _write_lock(root: Path, ws: wsm.Workspace, overrides: dict[str, Path]) -> str:
@@ -949,14 +947,18 @@ def upgrade(
 _WORKSPACE_TEMPLATE = """\
 # bee 워크스페이스 — 편집 표면(local) + baseline(snapshot) + 바인딩(coreInfra·cluster). 규칙 5.
 # cwd 상위 탐색으로 발견된다. 시크릿은 여기 두지 않는다 → bee.secrets.local.yaml.
+#
+# **소비 아티팩트(snapshot·core-infra)는 원격에서 읽는다** — work tree 에 두지 않고 .bee/cache 로
+# pin 해 fetch(chart→OCI G6 모델을 나머지로 확장). 편집 대상(내 모듈)만 repos/ 에 로컬 보유.
+# 플랫폼 메인테이너(core-infra 직접 편집)면 repo/ref → path: repos/core-infra 로 바꾼다.
 version: 1
-snapshot: { repo: repos/snapshot, env: dev, ref: main }   # backdrop baseline(규칙 7 — 경계 dev)
-coreInfra: { path: repos/core-infra, platform: CHANGEME }  # platforms/<platform>/platform.yaml
+snapshot:  { repo: "https://github.com/CHANGEME-ORG/bee-snapshot.git", env: dev, ref: main }
+coreInfra: { repo: "https://github.com/CHANGEME-ORG/bee-core-infra.git", ref: main, platform: CHANGEME, chartRef: "oci://ghcr.io/CHANGEME-ORG/charts/bee-module" }
 cluster: { context: kind-bee-local }                       # 인너루프 kubectl 컨텍스트(G7 — 공유환경 금지)
 # 빌드 사설 registry(G30) — 토큰은 bee.secrets.local.yaml[tokenEnv](또는 실제 env)에서 해석.
 buildRegistries: []
 #  - { name: kellnr, index: "sparse+http://HOST:PORT/api/v1/crates/", tokenEnv: CARGO_REGISTRIES_KELLNR_TOKEN }
-local: {}   # <module>: { path: repos/<module> } — 편집 표면(소스=멤버십, 규칙 5)
+local: {}   # <module>: { path: repos/<module> } — `bee pull <module>` 가 채운다(편집 표면, 규칙 5)
 """
 
 _SECRETS_TEMPLATE = """\
@@ -970,7 +972,8 @@ _SECRETS_TEMPLATE = """\
 @app.command()
 def init():
     """워크스페이스 스캐폴드(G31) — bee.workspace.yaml + bee.secrets.local.yaml(gitignore 등록).
-    맨손 온보딩: init → 바인딩·시크릿 채움 → bee substrate up → bee up. (워크스페이스 부트스트랩 갭 해소.)"""
+    맨손 온보딩(G35): init → URL·platform 채움 → `bee doctor`(원격 소비물 fetch·검증) →
+    `bee substrate up` → `bee pull <module>` → `bee up`. core-infra·snapshot 은 원격에서 읽는다(클론 불요)."""
     cwd = Path.cwd()
     for fname, tmpl, hint in [
         (wsm.WORKSPACE_FILE, _WORKSPACE_TEMPLATE, "coreInfra.platform·local 등록을 채워라"),
@@ -982,15 +985,15 @@ def init():
         else:
             f.write_text(tmpl, encoding="utf-8")
             _ok(f"{fname} 생성 — {hint}")
-    # .gitignore 에 시크릿 파일 등록(커밋 차단). 없으면 생성.
+    # .gitignore 에 시크릿 파일 + .bee/(lock·원격 소비 캐시) + repos/(편집 모듈, 각자 독립 git) 등록.
     gi = cwd / ".gitignore"
     lines = gi.read_text(encoding="utf-8").splitlines() if gi.exists() else []
-    if wsm.SECRETS_FILE not in lines:
-        body = "\n".join([*lines, wsm.SECRETS_FILE]) + "\n"
-        gi.write_text(body, encoding="utf-8")
-        _ok(f".gitignore 에 {wsm.SECRETS_FILE} 등록(시크릿 커밋 차단)")
+    added = [e for e in (wsm.SECRETS_FILE, ".bee/", "repos/") if e not in lines]
+    if added:
+        gi.write_text("\n".join([*lines, *added]) + "\n", encoding="utf-8")
+        _ok(f".gitignore 등록: {', '.join(added)}")
     else:
-        _ok(f".gitignore 에 {wsm.SECRETS_FILE} 이미 등록됨")
+        _ok(".gitignore 항목 이미 등록됨(시크릿·캐시·모듈)")
 
 
 if __name__ == "__main__":
