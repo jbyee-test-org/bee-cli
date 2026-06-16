@@ -870,5 +870,24 @@ def substrate_up(
     substrate_up_impl(root, ws, remote_ok=remote_ok)
 
 
+# bee 자체 업그레이드 대상 레포(G10 데모 미러 — 실 제품은 설정화 후속).
+BEE_CLI_REPO = "https://github.com/jbyee-test-org/bee-cli"
+
+
+@app.command()
+def upgrade(
+    ref: str = typer.Argument("main", help="git ref(tag/branch) — 기본 main(최신). 예: v0.5.2"),
+):
+    """전역 bee 자체 업그레이드(G30) — `uv tool install --force git+<repo>@<ref>`. 릴리스 후 즉시 갱신.
+    (uv 필요. 전역 설치본을 교체 — 개발용 `uv run` 와 무관. 워크스페이스 밖에서도 동작.)"""
+    import shutil
+    if not shutil.which("uv"):
+        _fail("uv 없음 — 전역 설치는 uv tool 사용. https://docs.astral.sh/uv")
+    spec = f"git+{BEE_CLI_REPO}@{ref}"
+    typer.secho(f"bee 업그레이드 → uv tool install --force {spec}", bold=True)
+    kube.run(["uv", "tool", "install", "--force", spec])
+    _ok(f"전역 bee 갱신됨(@{ref}) — `bee --version` 으로 확인")
+
+
 if __name__ == "__main__":
     app()
