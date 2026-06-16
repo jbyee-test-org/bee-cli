@@ -31,6 +31,7 @@ from pathlib import Path
 import yaml
 
 WORKSPACE_FILE = "bee.workspace.yaml"
+SECRETS_FILE = "bee.secrets.local.yaml"   # 워크스페이스-스코프 시크릿(빌드 토큰 등). gitignore — 커밋 금지(G31).
 LOCK_FILE = ".bee/workspace.lock.yaml"
 PLATFORMS_DIR = "platforms"  # core-infra 안의 디스크립터 홈: <core-infra>/platforms/<name>/platform.yaml
 CHART_DIR = "chart"          # core-infra 안의 공용 차트
@@ -133,6 +134,16 @@ def load_workspace(root: Path) -> Workspace:
     if not f.exists():
         raise WorkspaceError(f"{WORKSPACE_FILE} 없음: {root}")
     return Workspace.from_dict(yaml.safe_load(f.read_text(encoding="utf-8")) or {})
+
+
+def load_workspace_secrets(root: Path) -> dict:
+    """워크스페이스-스코프 시크릿(G31) — `bee.secrets.local.yaml`({ENV_VAR: value} 맵, gitignore).
+    빌드 토큰 등 워크스페이스 레벨 자격증명. 없으면 {}(빌드는 실제 env 로 폴백). **모듈** 시크릿은
+    모듈별 `secrets.local.yaml`(별개 — 중앙화 안 함)."""
+    f = root / SECRETS_FILE
+    if not f.exists():
+        return {}
+    return yaml.safe_load(f.read_text(encoding="utf-8")) or {}
 
 
 def _merge_into(dst: dict, src: dict) -> None:

@@ -1,6 +1,6 @@
 [project]
 name = "bee-cli"
-version = "0.5.2"
+version = "0.5.3"
 description = "bee — thin CLI (기계적 배치). 엔진=chart(helm) · 데이터=values · 검증=CI. 단일 기준: GENESIS.md"
 requires-python = ">=3.11"
 dependencies = ["typer>=0.12", "pyyaml>=6.0", "packaging>=24.0", "textual>=1.0", "ruamel.yaml>=0.18"]

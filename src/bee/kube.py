@@ -10,25 +10,41 @@ class ToolError(RuntimeError):
     """외부 도구 실패."""
 
 
-def run(cmd: list[str], *, input_text: str | None = None, check: bool = True) -> subprocess.CompletedProcess:
-    r = subprocess.run(cmd, input=input_text, capture_output=True, text=True)
+def run(cmd: list[str], *, input_text: str | None = None, check: bool = True,
+        env: dict | None = None) -> subprocess.CompletedProcess:
+    r = subprocess.run(cmd, input=input_text, capture_output=True, text=True, env=env)
     if check and r.returncode != 0:
         raise ToolError(f"$ {' '.join(cmd)}\n{(r.stderr or r.stdout).strip()}")
     return r
 
 
-def docker_build(tag: str, context_dir: Path, secrets: tuple[tuple[str, str], ...] = ()) -> None:
-    """docker build. secrets=((id, env_var), …) → BuildKit `--mount=type=secret`(사설 registry 토큰 등,
-    G30). 토큰은 레이어에 안 박힘. docker 29 는 BuildKit 기본."""
+def docker_build(tag: str, context_dir: Path, secrets: tuple[tuple[str, str, str | None], ...] = ()) -> None:
+    """docker build. secrets=((id, env_var, value), …) → BuildKit `--mount=type=secret`(사설 registry
+    토큰 등, G30). value(bee.secrets.local.yaml 또는 실제 env, G31)를 subprocess env 에 넣고 env= 로
+    전달 — 토큰은 레이어에 안 박힘. docker 29 는 BuildKit 기본."""
+    import os
+    sub_env = dict(os.environ)
     cmd = ["docker", "build", "-q", "-t", tag]
-    for sid, senv in secrets:
+    for sid, senv, sval in secrets:
+        if sval:
+            sub_env[senv] = sval
         cmd += ["--secret", f"id={sid},env={senv}"]
     cmd.append(str(context_dir))
-    run(cmd)
+    run(cmd, env=sub_env)
 
 
 def kind_load(tag: str, cluster: str) -> None:
     run(["kind", "load", "docker-image", tag, "--name", cluster])
+
+
+def docker_push(tag: str) -> str:
+    """push 후 RepoDigests[0] 의 digest(`sha256:…`) 반환 — bee build --push(G31/C) 가
+    아웃터 이미지를 registry 에 올리고 digest 를 얻어 `bee publish --digest` 로 잇는다.
+    매니페스트는 이 digest 를 pin(태그 무관)."""
+    run(["docker", "push", tag])
+    r = run(["docker", "inspect", "--format", "{{index .RepoDigests 0}}", tag])
+    repo_digest = r.stdout.strip()  # registry/image@sha256:…
+    return repo_digest.split("@", 1)[1] if "@" in repo_digest else ""
 
 
 def ensure_namespace(ctx: str, ns: str) -> None:

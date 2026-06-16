@@ -8,6 +8,7 @@ CLI 에 derive/gate 를 추가하지 마라.
 from __future__ import annotations
 
 import hashlib
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -141,19 +142,32 @@ def _render(chart, mdir: Path, env: str, name: str, set_values: tuple[str, ...] 
     return r.stdout
 
 
-def _image_tag(mdir: Path) -> str:
-    m, v = _yaml_at(mdir / "module.yaml"), _yaml_at(mdir / "values-local.yaml")
+def _image_ref(mdir: Path, env: str = "local") -> tuple[str | None, str | None]:
+    """(registry, image) — registry 는 values-<env>.yaml(좌표, 규칙 3), image 는 module.yaml.
+    push 타깃 registry 가 env 마다 다르므로(local=localhost/dev, dev=ghcr…) env 로 고른다."""
+    m, v = _yaml_at(mdir / "module.yaml"), _yaml_at(mdir / f"values-{env}.yaml")
     image = ((m.get("spec") or {}).get("image") or {}).get("name")
-    return f"{v.get('registry')}/{image}:{v.get('imageTag', 'local')}"
+    return v.get("registry"), image
 
 
-def _build_secrets(ws: wsm.Workspace) -> tuple[tuple[str, str], ...]:
-    """워크스페이스 buildRegistries(G30) → docker BuildKit secret 인자 ((id, env_var), …).
-    id=`<name>_token` — Dockerfile 의 `--mount=type=secret,id=<name>_token` 과 매칭. 토큰은
-    tokenEnv 환경변수에서(레이어 미박힘). 미설정 registry 는 건너뜀(빌드는 빌더 책임 — bee 는 전달만)."""
-    return tuple((f"{r['name']}_token", r["tokenEnv"])
-                 for r in ws.build_registries
-                 if r.get("name") and r.get("tokenEnv"))
+def _image_tag(mdir: Path) -> str:
+    registry, image = _image_ref(mdir, "local")
+    v = _yaml_at(mdir / "values-local.yaml")
+    return f"{registry}/{image}:{v.get('imageTag', 'local')}"
+
+
+def _build_secrets(ws: wsm.Workspace, root: Path) -> tuple[tuple[str, str, str | None], ...]:
+    """워크스페이스 buildRegistries(G30) → docker BuildKit secret ((id, env_var, value), …).
+    id=`<name>_token` — Dockerfile 의 `--mount=type=secret,id=<name>_token` 과 매칭. value(토큰)는
+    **`bee.secrets.local.yaml`[env_var]**(워크스페이스 시크릿, G31) 우선, 없으면 실제 env(CI). 둘 다
+    없으면 None(doctor 가 경고·빌드는 명확히 실패). 빌드는 빌더 책임 — bee 는 토큰을 *전달*만(레이어 미박힘)."""
+    secrets = wsm.load_workspace_secrets(root)
+    out = []
+    for r in ws.build_registries:
+        name, tenv = r.get("name"), r.get("tokenEnv")
+        if name and tenv:
+            out.append((f"{name}_token", tenv, secrets.get(tenv) or os.environ.get(tenv)))
+    return tuple(out)
 
 
 def _has_image(mdir: Path) -> bool:
@@ -312,9 +326,42 @@ def build_impl(names: list[str], root: Path, ws: wsm.Workspace) -> None:
             typer.secho(f"  {name}: image 없음 — schema 모듈(G21), build 생략", dim=True)
             continue
         tag = _image_tag(overrides[name])
-        kube.docker_build(tag, overrides[name], _build_secrets(ws))
+        kube.docker_build(tag, overrides[name], _build_secrets(ws, root))
         kube.kind_load(tag, cluster)
         _ok(f"{name}: docker build → kind load ({tag})")
+
+
+def build_push_impl(names: list[str], root: Path, ws: wsm.Workspace, env: str) -> None:
+    """아웃터 이미지 준비(G31/C) — values-<env> registry 로 build+push → digest 출력.
+    빌드는 빌더 책임(G30)이라 CI 가 아니라 토큰 가진 로컬이 한다. **정합 가드**(소스↔이미지↔스냅샷, #2):
+    커밋된 클린 트리만 빌드하고 `sha-<commit>` 으로 태깅 → CI 가 모듈@commit 체크아웃해 publish 하면
+    provenance(moduleCommit=commit, imageDigest=digest)가 닫힌다. 매니페스트는 digest pin(태그 무관)."""
+    overrides = wsm.override_dirs(ws, root)
+    secrets = _build_secrets(ws, root)
+    for name in names:
+        if name not in overrides:
+            _fail(f"{name!r} 는 from-local 이 아니다 — build 는 편집 표면 전용(규칙 5)")
+        mdir = overrides[name]
+        if not _has_image(mdir):
+            typer.secho(f"  {name}: image 없음 — schema 모듈(G21), push 생략(digest 없이 publish)", dim=True)
+            continue
+        # 정합 가드: 모듈은 **자체 독립 git**(G3)이어야 하고(상위 레포로 walk-up 금지), 클린·커밋 상태여야 한다.
+        commit = kube.git(["rev-parse", "HEAD"], mdir)
+        toplevel = kube.git(["rev-parse", "--show-toplevel"], mdir)
+        if not commit or not toplevel or Path(toplevel).resolve() != mdir.resolve():
+            _fail(f"{name}: 모듈 자체 git 레포 아님 — --push 는 모듈별 독립 git(G3)의 커밋된 소스 필요"
+                  f"(CI 가 모듈@commit 체크아웃 → moduleCommit↔imageDigest 정합, #2). repos/{name} 에서 git init + 커밋")
+        if kube.git(["status", "--porcelain"], mdir):
+            _fail(f"{name}: 작업 트리 dirty — --push 는 커밋된 소스만(소스↔이미지↔스냅샷 정합, #2). 커밋 후 재시도")
+        registry, image = _image_ref(mdir, env)
+        if not registry:
+            _fail(f"{name}: values-{env}.yaml 에 registry 없음 — push 타깃 좌표 필요(규칙 3)")
+        tag = f"{registry}/{image}:sha-{commit[:7]}"
+        kube.docker_build(tag, mdir, secrets)
+        digest = kube.docker_push(tag)
+        _ok(f"{name}: build+push → {tag}")
+        typer.secho(f"     digest: {digest}", fg=OK, bold=True)
+        typer.secho(f"     다음: gh workflow run publish-dev.yaml -f digest={digest}  (CI publish, env={env})", dim=True)
 
 
 def _apply_local_secrets(name: str, mdir: Path, ns: str, ctx: str) -> None:
@@ -351,7 +398,7 @@ def up_impl(roots: list[str] | None, root: Path, ws: wsm.Workspace, *, no_build:
             mdir = overrides[name]
             if not no_build and _has_image(mdir):   # image 없으면 schema 모듈(G21) — build 생략
                 tag = _image_tag(mdir)
-                kube.docker_build(tag, mdir, _build_secrets(ws))
+                kube.docker_build(tag, mdir, _build_secrets(ws, root))
                 kube.kind_load(tag, ctx.removeprefix("kind-"))
             _chart_warnings(mdir / "module.yaml", chart, pyaml)
             sets = (f"namespace={ns}",)
@@ -709,9 +756,9 @@ def doctor_impl(*, remote_ok: bool = False) -> int:
             "Kong ingressclass" if kong
             else "Kong 없음 — routing 어휘(Ingress) 적용 불가, `bee substrate up` 필요")
 
-    # 5. build registry (G30 — 사설 registry 도달 + tokenEnv 점검. read-only · 빌드 프리플라이트)
+    # 5. build registry (G30/G31 — 도달 + 토큰(bee.secrets.local.yaml 또는 env) 점검. read-only)
     if ws.build_registries:
-        import os
+        wsecrets = wsm.load_workspace_secrets(root)
         typer.secho("\nbuild registry (G30 — 빌드 사설 registry)", bold=True)
         for r in ws.build_registries:
             name, idx, tenv = r.get("name", "?"), r.get("index", ""), r.get("tokenEnv", "")
@@ -721,9 +768,10 @@ def doctor_impl(*, remote_ok: bool = False) -> int:
             reachable = bool(rc) and rc != "000"
             rep("ok" if reachable else "warn",
                 f"{name}: 도달 {url or '(index 없음)'} (http {rc or '실패'})")
-            tok_set = bool(tenv) and bool(os.environ.get(tenv))
-            rep("ok" if tok_set else "warn",
-                f"{name}: 토큰 env ${tenv or '?'} " + ("설정됨" if tok_set else "미설정 — bee build 시 필요"))
+            src = ("bee.secrets.local" if tenv and wsecrets.get(tenv)
+                   else "env" if tenv and os.environ.get(tenv) else None)
+            rep("ok" if src else "warn",
+                f"{name}: 토큰 ${tenv or '?'} " + (f"설정됨({src})" if src else "미설정 — bee.secrets.local.yaml 또는 env"))
 
     # 6. pin 정합 (G6 — 경고만, 차단은 CI)
     typer.secho("\npin 정합 (G6 — 경고만, 차단은 CI)", bold=True)
@@ -790,11 +838,19 @@ def render(
 
 
 @app.command()
-def build(modules: list[str] = typer.Argument(None, help="기본: 편집 표면 전체")):
-    """from-local 이미지 빌드 — docker build + kind load (Phase 1: local 타겟)."""
+def build(
+    modules: list[str] = typer.Argument(None, help="기본: 편집 표면 전체"),
+    env: str = typer.Option("local", "-e", "--env", help="좌표 env — --push 의 registry 선택(values-<env>)"),
+    push: bool = typer.Option(False, "--push", help="values-<env> registry 로 빌드+푸시 → digest(아웃터 이미지 준비, C). 기본=kind-load(인너)"),
+):
+    """from-local 이미지 빌드. 기본 = docker build + kind load(인너루프). --push = values-<env>
+    registry 로 푸시 + digest 출력(아웃터 — CI 는 그 digest 로 publish 만, Kellnr 토큰 미접촉)."""
     root, ws = load_ctx()
     names = list(modules) if modules else sorted(wsm.override_dirs(ws, root))
-    build_impl(names, root, ws)
+    if push:
+        build_push_impl(names, root, ws, env)
+    else:
+        build_impl(names, root, ws)
 
 
 @app.command()
@@ -887,6 +943,54 @@ def upgrade(
     typer.secho(f"bee 업그레이드 → uv tool install --force {spec}", bold=True)
     kube.run(["uv", "tool", "install", "--force", spec])
     _ok(f"전역 bee 갱신됨(@{ref}) — `bee --version` 으로 확인")
+
+
+# 워크스페이스 스캐폴드 템플릿(G31). 채울 곳은 CHANGEME · 빈 컨테이너로 둔다(주석으로 유도).
+_WORKSPACE_TEMPLATE = """\
+# bee 워크스페이스 — 편집 표면(local) + baseline(snapshot) + 바인딩(coreInfra·cluster). 규칙 5.
+# cwd 상위 탐색으로 발견된다. 시크릿은 여기 두지 않는다 → bee.secrets.local.yaml.
+version: 1
+snapshot: { repo: repos/snapshot, env: dev, ref: main }   # backdrop baseline(규칙 7 — 경계 dev)
+coreInfra: { path: repos/core-infra, platform: CHANGEME }  # platforms/<platform>/platform.yaml
+cluster: { context: kind-bee-local }                       # 인너루프 kubectl 컨텍스트(G7 — 공유환경 금지)
+# 빌드 사설 registry(G30) — 토큰은 bee.secrets.local.yaml[tokenEnv](또는 실제 env)에서 해석.
+buildRegistries: []
+#  - { name: kellnr, index: "sparse+http://HOST:PORT/api/v1/crates/", tokenEnv: CARGO_REGISTRIES_KELLNR_TOKEN }
+local: {}   # <module>: { path: repos/<module> } — 편집 표면(소스=멤버십, 규칙 5)
+"""
+
+_SECRETS_TEMPLATE = """\
+# 워크스페이스-스코프 시크릿(G31) — 빌드 토큰 등. {ENV_VAR: value} 맵.
+# **gitignore — 커밋 금지.** 모듈 시크릿은 모듈별 secrets.local.yaml(별개 — 중앙화 안 함).
+# buildRegistries[].tokenEnv 가 여기서 해석된다. 예:
+# CARGO_REGISTRIES_KELLNR_TOKEN: "<token>"
+"""
+
+
+@app.command()
+def init():
+    """워크스페이스 스캐폴드(G31) — bee.workspace.yaml + bee.secrets.local.yaml(gitignore 등록).
+    맨손 온보딩: init → 바인딩·시크릿 채움 → bee substrate up → bee up. (워크스페이스 부트스트랩 갭 해소.)"""
+    cwd = Path.cwd()
+    for fname, tmpl, hint in [
+        (wsm.WORKSPACE_FILE, _WORKSPACE_TEMPLATE, "coreInfra.platform·local 등록을 채워라"),
+        (wsm.SECRETS_FILE, _SECRETS_TEMPLATE, "빌드 토큰 등을 채워라(커밋 금지)"),
+    ]:
+        f = cwd / fname
+        if f.exists():
+            _warn(f"{fname} 이미 존재 — 건너뜀")
+        else:
+            f.write_text(tmpl, encoding="utf-8")
+            _ok(f"{fname} 생성 — {hint}")
+    # .gitignore 에 시크릿 파일 등록(커밋 차단). 없으면 생성.
+    gi = cwd / ".gitignore"
+    lines = gi.read_text(encoding="utf-8").splitlines() if gi.exists() else []
+    if wsm.SECRETS_FILE not in lines:
+        body = "\n".join([*lines, wsm.SECRETS_FILE]) + "\n"
+        gi.write_text(body, encoding="utf-8")
+        _ok(f".gitignore 에 {wsm.SECRETS_FILE} 등록(시크릿 커밋 차단)")
+    else:
+        _ok(f".gitignore 에 {wsm.SECRETS_FILE} 이미 등록됨")
 
 
 if __name__ == "__main__":
