@@ -214,6 +214,13 @@ def _migrations_hash(mdir: Path) -> str:
     return h.hexdigest()[:12]
 
 
+def _module_uses(spec: dict) -> set[str]:
+    """모듈이 *사용*하는 substrate capability — 논리 어휘(db/events/routing)에서 **파생**(G36).
+    명시 `uses` 필드(외부 인프라 btc 등 어휘 미덮)는 G28 ② 연기분 — 파생이지 신규 모듈 어휘 0."""
+    s = spec or {}
+    return {cap for cap in ("db", "events", "routing") if s.get(cap)}
+
+
 def _all_specs(overrides: dict[str, Path], snaps: dict) -> dict[str, "resolver.ModuleSpec"]:
     """local + snapshot 의 전체 module spec — depth 계산용 그래프."""
     specs: dict = {}
@@ -753,6 +760,29 @@ def doctor_impl(*, remote_ok: bool = False) -> int:
         rep("ok" if kong else "warn",
             "Kong ingressclass" if kong
             else "Kong 없음 — routing 어휘(Ingress) 적용 불가, `bee substrate up` 필요")
+
+    # 4.5 capability 정합 (uses/provides — G36): 모듈 used(어휘 파생) ⊆ platform substrate.provides.
+    #     선언+검증(프로비저닝 아님 — provider 적용=substrate up, G26). 멀티-provider 코덱은 G28 연기.
+    if overrides:
+        typer.secho("\ncapability (uses/provides — G36, 선언+검증)", bold=True)
+        provides: dict = {}
+        try:
+            pp = wsm.platform_yaml_path(ws, root)
+            if pp:
+                provides = ((_yaml_at(pp).get("spec") or {}).get("substrate") or {}).get("provides") or {}
+        except Exception:
+            provides = {}
+        if not provides:
+            rep("warn", "platform.yaml substrate.provides 미선언 — uses/provides 검증 생략(G36)")
+        else:
+            rep("ok", f"platform provides: {', '.join(sorted(provides))}")
+            for n, d in sorted(overrides.items()):
+                uses = _module_uses(_yaml_at(d / "module.yaml").get("spec") or {})
+                missing = uses - set(provides)
+                if missing:
+                    rep("warn", f"{n}: uses {{{', '.join(sorted(missing))}}} ⊄ provides — 플랫폼 미제공(substrate 확인)")
+                elif uses:
+                    rep("ok", f"{n}: uses {{{', '.join(sorted(uses))}}} ⊆ provides")
 
     # 5. build registry (G30/G31 — 도달 + 토큰(bee.secrets.local.yaml 또는 env) 점검. read-only)
     if ws.build_registries:
