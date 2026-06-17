@@ -987,7 +987,7 @@ def down(
 
 @app.command()
 def publish(
-    env: str = typer.Argument(..., help="공유 env (dev/staging/prod) — local 금지(규칙 7)"),
+    env: str = typer.Argument(..., help="공유 env (dev/prod — G51) — local 금지(규칙 7)"),
     modules: list[str] = typer.Argument(None, help="기본: 편집 표면 전체"),
     digest: str = typer.Option("", "--digest", help="이미지 digest (CI 가 주입 — 모듈 1개와만)"),
     push: bool = typer.Option(False, "--push", help="커밋 후 원격 push"),
