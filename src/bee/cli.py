@@ -125,21 +125,45 @@ def _pin(mdir: Path) -> str | None:
     return ((_yaml_at(mdir / "module.yaml").get("spec") or {}).get("chart") or {}).get("version")
 
 
-def _render(chart, mdir: Path, env: str, name: str, set_values: tuple[str, ...] = ()) -> str:
+def _render(chart, mdir: Path, env: str, name: str, set_values: tuple[str, ...] = (),
+            platform_resources: dict | None = None) -> str:
+    import tempfile
     values = mdir / f"values-{env}.yaml"
     if not values.exists():
         _fail(f"{name}: values-{env}.yaml 없음: {mdir}")
-    cmd = ["helm", "template", name, str(chart), "-f", str(mdir / "module.yaml"), "-f", str(values)]
+    # platform 리소스 프로파일(G37) = .Values.resources — **낮은 우선순위 -f**(values-<env> 가 override,
+    # 규칙 3). chart 가 spec.uses 로 룩업·렌더(rule 1 — 파생은 차트). bee 는 기계적 전달만.
+    pre, tmp = [], None
+    if platform_resources:
+        fd, tmp = tempfile.mkstemp(suffix=".yaml")
+        with os.fdopen(fd, "w") as f:
+            yaml.safe_dump({"resources": platform_resources}, f, allow_unicode=True)
+        pre = ["-f", tmp]
+    cmd = ["helm", "template", name, str(chart), *pre, "-f", str(mdir / "module.yaml"), "-f", str(values)]
     if isinstance(chart, str) and chart.startswith("oci://"):
         ver = _pin(mdir)
         if ver:
             cmd += ["--version", str(ver)]
     for sv in set_values:
         cmd += ["--set", sv]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    finally:
+        if tmp:
+            os.unlink(tmp)
     if r.returncode != 0:
         _fail(f"{name}: helm 렌더 실패\n{r.stderr.strip()}")
     return r.stdout
+
+
+def _platform_resources(ws: wsm.Workspace, root: Path) -> dict:
+    """platform.yaml spec.resources(G37 리소스 프로파일) → chart 에 `.Values.resources` 로 전달.
+    모듈 `spec.uses` 가 논리 참조하면 chart 가 룩업·렌더. 없으면 {}(리소스 미선언 모듈 무영향)."""
+    try:
+        p = wsm.platform_yaml_path(ws, root)
+    except wsm.WorkspaceError:
+        return {}
+    return ((_yaml_at(p).get("spec") or {}).get("resources") or {}) if p else {}
 
 
 def _image_ref(mdir: Path, env: str = "local") -> tuple[str | None, str | None]:
@@ -412,7 +436,8 @@ def up_impl(roots: list[str] | None, root: Path, ws: wsm.Workspace, *, no_build:
                 sets += (f"migrationWave={_migration_wave(name, _all_specs(overrides, snaps))}",
                          f"dbMigrationsHash={mig_hash}")
                 _grant_warnings(name, overrides, snaps)
-            manifests, src = _render(chart, mdir, "local", name, set_values=sets), "local"
+            manifests, src = _render(chart, mdir, "local", name, set_values=sets,
+                                     platform_resources=_platform_resources(ws, root)), "local"
         else:
             sm = snaps[name]
             manifests, src = "\n---\n".join(p.read_text(encoding="utf-8") for p in sm.manifests), "snapshot"
@@ -442,7 +467,8 @@ def down_impl(root: Path, ws: wsm.Workspace, *, remote_ok: bool = False) -> None
             continue
         ns = _namespace(name, _module_data(name, overrides, snaps), products)
         if name in overrides:
-            manifests = _render(chart, overrides[name], "local", name, set_values=(f"namespace={ns}",))
+            manifests = _render(chart, overrides[name], "local", name, set_values=(f"namespace={ns}",),
+                                platform_resources=_platform_resources(ws, root))
         else:
             manifests = "\n---\n".join(p.read_text(encoding="utf-8") for p in snaps[name].manifests)
         kube.delete(ctx, ns, manifests)
@@ -542,7 +568,8 @@ def publish_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Worksp
             sets += (f"migrationWave={_migration_wave(name, _all_specs({name: mdir}, snaps))}",
                      f"dbMigrationsHash={_migrations_hash(mdir)}")
             _grant_warnings(name, {name: mdir}, snaps)
-        manifests = _render(chart, mdir, env, name, set_values=sets)
+        manifests = _render(chart, mdir, env, name, set_values=sets,
+                            platform_resources=_platform_resources(ws, root))
         spec = _yaml_at(mdir / "module.yaml").get("spec") or {}
         prov = {
             "module": name,
@@ -761,28 +788,51 @@ def doctor_impl(*, remote_ok: bool = False) -> int:
             "Kong ingressclass" if kong
             else "Kong 없음 — routing 어휘(Ingress) 적용 불가, `bee substrate up` 필요")
 
-    # 4.5 capability 정합 (uses/provides — G36): 모듈 used(어휘 파생) ⊆ platform substrate.provides.
-    #     선언+검증(프로비저닝 아님 — provider 적용=substrate up, G26). 멀티-provider 코덱은 G28 연기.
+    # 4.5 capability/resource 정합 (uses/provides — G36 capability-종류 · G37 리소스-프로파일):
+    #     모듈 used(어휘 파생) ⊆ substrate.provides · 모듈 uses(compute/storage) ⊆ resources 프로파일.
+    #     선언+검증(프로비저닝 아님 — provider=substrate up·volume=StorageClass, G26). 멀티-provider 코덱은 G28 연기.
     if overrides:
-        typer.secho("\ncapability (uses/provides — G36, 선언+검증)", bold=True)
-        provides: dict = {}
+        typer.secho("\ncapability/resource (uses/provides — G36·G37, 선언+검증)", bold=True)
+        pspec: dict = {}
         try:
             pp = wsm.platform_yaml_path(ws, root)
-            if pp:
-                provides = ((_yaml_at(pp).get("spec") or {}).get("substrate") or {}).get("provides") or {}
+            pspec = (_yaml_at(pp).get("spec") or {}) if pp else {}
         except Exception:
-            provides = {}
-        if not provides:
-            rep("warn", "platform.yaml substrate.provides 미선언 — uses/provides 검증 생략(G36)")
+            pspec = {}
+        provides = (pspec.get("substrate") or {}).get("provides") or {}
+        rprof = pspec.get("resources") or {}
+        if not provides and not rprof:
+            rep("warn", "platform.yaml substrate.provides·resources 미선언 — 검증 생략(G36/G37)")
         else:
-            rep("ok", f"platform provides: {', '.join(sorted(provides))}")
+            if provides:
+                rep("ok", f"platform provides: {', '.join(sorted(provides))}")
+            if rprof:
+                rep("ok", f"platform resources: compute={{{','.join(sorted(rprof.get('compute') or {}))}}}"
+                          f" storage={{{','.join(sorted(rprof.get('storage') or {}))}}}")
             for n, d in sorted(overrides.items()):
-                uses = _module_uses(_yaml_at(d / "module.yaml").get("spec") or {})
-                missing = uses - set(provides)
-                if missing:
-                    rep("warn", f"{n}: uses {{{', '.join(sorted(missing))}}} ⊄ provides — 플랫폼 미제공(substrate 확인)")
+                spec = _yaml_at(d / "module.yaml").get("spec") or {}
+                uses = _module_uses(spec)
+                cmiss = uses - set(provides)
+                if cmiss:
+                    rep("warn", f"{n}: uses {{{', '.join(sorted(cmiss))}}} ⊄ provides — 플랫폼 미제공(substrate)")
                 elif uses:
-                    rep("ok", f"{n}: uses {{{', '.join(sorted(uses))}}} ⊆ provides")
+                    rep("ok", f"{n}: capability {{{', '.join(sorted(uses))}}} ⊆ provides")
+                # G37 리소스 프로파일
+                u = spec.get("uses") or {}
+                rmiss, have = [], []
+                if u.get("compute"):
+                    have.append(f"compute:{u['compute']}")
+                    if u["compute"] not in (rprof.get("compute") or {}):
+                        rmiss.append(f"compute:{u['compute']}")
+                sp = (u.get("storage") or {}).get("profile")
+                if sp:
+                    have.append(f"storage:{sp}")
+                    if sp not in (rprof.get("storage") or {}):
+                        rmiss.append(f"storage:{sp}")
+                if rmiss:
+                    rep("warn", f"{n}: 리소스 프로파일 {{{', '.join(rmiss)}}} 미정의 — platform.resources 확인")
+                elif have:
+                    rep("ok", f"{n}: resource {{{', '.join(have)}}} ⊆ profiles")
 
     # 5. build registry (G30/G31 — 도달 + 토큰(bee.secrets.local.yaml 또는 env) 점검. read-only)
     if ws.build_registries:
@@ -862,7 +912,8 @@ def render(
     mdir = overrides[module]
     _chart_warnings(mdir / "module.yaml", chart, wsm.platform_yaml_path(ws, root))
     ns = _namespace(module, _yaml_at(mdir / "module.yaml"), _products(ws, root))
-    sys.stdout.write(_render(chart, mdir, env, module, set_values=(f"namespace={ns}",)))
+    sys.stdout.write(_render(chart, mdir, env, module, set_values=(f"namespace={ns}",),
+                             platform_resources=_platform_resources(ws, root)))
 
 
 @app.command()
