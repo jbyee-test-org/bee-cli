@@ -496,7 +496,8 @@ def substrate_up_impl(root: Path, ws: wsm.Workspace, *, remote_ok: bool = False)
     if not sub.is_dir():
         _fail(f"substrate 디렉토리 없음 — {sub}")
 
-    # 1. 정적 매니페스트(ns·postgres·nats·nack). server-side: NACK CRD 가 client-side annotation 한도 초과.
+    # 1. 정적 매니페스트(ns·postgres·nats·bitcoind). server-side apply(--force-conflicts) — 재적용 안전.
+    #    (이전엔 nack/ CRD 가 client-side annotation 한도를 넘겨 server-side 필수였음 — NACK 은 G42 에서 제거.)
     typer.secho(f"substrate 정적 적용 → kubectl apply -R (ctx={ctx})", bold=True)
     out = kube.run(["kubectl", "--context", ctx, "apply", "--server-side", "--force-conflicts",
                     "-R", "-f", str(sub)]).stdout
@@ -777,7 +778,9 @@ def doctor_impl(*, remote_ok: bool = False) -> int:
     else:
         def _chk(args: list[str]) -> bool:
             return kube.run(["kubectl", "--context", ctx, *args], check=False).returncode == 0
-        # postgres·nats = bee-substrate ns Deployment / NACK = CRD(cluster-scoped) / Kong = ingressclass
+        # postgres·nats = bee-substrate ns Deployment / Kong = ingressclass.
+        # NATS 는 접속형 substrate(G42): JetStream(`-js`)만 켜져 있으면 충분 — 발행 앱이
+        # JetStream API 로 stream 을 직접 소유한다. NACK(CR 브리지) 점검은 G42 에서 제거.
         for ns, dep, label in [("bee-substrate", "postgres", "postgres"), ("bee-substrate", "nats", "NATS")]:
             r = kube.run(["kubectl", "--context", ctx, "-n", ns, "get", "deploy", dep,
                           "-o", "jsonpath={.status.readyReplicas}"], check=False)
@@ -787,10 +790,6 @@ def doctor_impl(*, remote_ok: bool = False) -> int:
                 rep("ok", f"{label} Ready (ns {ns})")
             else:
                 rep("warn", f"{label} Not Ready (ns {ns})")
-        nack = _chk(["get", "crd", "streams.jetstream.nats.io"])
-        rep("ok" if nack else "warn",
-            "NACK CRD (streams.jetstream.nats.io)" if nack
-            else "NACK CRD 없음 — events 어휘(Stream/Consumer) 적용 불가, `bee substrate up` 필요")
         kong = _chk(["get", "ingressclass", "kong"])
         rep("ok" if kong else "warn",
             "Kong ingressclass" if kong
