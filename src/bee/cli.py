@@ -603,8 +603,10 @@ def publish_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Worksp
         if cm:
             manifests = manifests + "\n---\n" + cm
         db_dir = mdir / "db"
+        contracts_dir = mdir / "contracts"   # 계약 표면(openapi/asyncapi) 운반 — bee 는 복사만(파생 0, bee contracts)
         snap_mod.write_entry(env_dir, name, mdir / "module.yaml", manifests, provenance=prov,
-                             db_src=db_dir if db_dir.is_dir() else None)
+                             db_src=db_dir if db_dir.is_dir() else None,
+                             contracts_src=contracts_dir if contracts_dir.is_dir() else None)
         _ok(f"{name} → envs/{env}/{name}  "
             + ("(digest pin)" if digest
                else "(image 없음 — schema 모듈, G21)" if not _has_image(mdir)
@@ -1014,6 +1016,41 @@ def status():
     """스냅샷 pin vs HEAD — 내 서브그래프 변경만 보고(규칙 8). 자동폴링 없음."""
     root, ws = load_ctx()
     status_impl(root, ws)
+
+
+@app.command()
+def contracts(
+    module: str = typer.Argument(..., help="모듈 — 스냅샷(backdrop)에 운반된 계약 표면 노출"),
+    kind: str = typer.Option(None, "--kind", help="openapi|asyncapi — 지정 시 내용 출력(cat), 미지정=목록"),
+):
+    """모듈 계약 표면(openapi/asyncapi) **read-only 노출** — 스냅샷에 운반·보관된 계약(파생·검증 0).
+
+    bee = dumb pipe: 계약을 *보여줄* 뿐 *맞다고* 안 한다 — 정합·신선도는 사람(또는 별도 lint).
+    어휘 0(파일 존재로 표현, module.yaml 무관) · 출처 = 모듈 `contracts/`(starter 스캐폴드, publish 가 운반).
+    원격 소비(G35)면 `.bee/cache` 스냅샷에서 읽는다. **G42 events 걷어내기의 양성 주인** — events
+    계약은 thin 어휘가 아니라 표준 asyncapi 로, bee 는 운반·노출만.
+    """
+    root, ws = load_ctx()
+    env_dir = wsm.resolve_snapshot_env_dir(ws, root)
+    cdir = env_dir / module / "contracts"
+    if not cdir.is_dir():
+        _fail(f"{module}: 계약 없음 — 스냅샷 envs/{ws.env}/{module}/contracts/ 부재. "
+              f"통신 프로토콜이 있으면 모듈에 contracts/ 작성(starter 템플릿 참조).")
+    files = sorted(p for p in cdir.iterdir() if p.is_file() and p.suffix in (".yaml", ".yml"))
+    if kind:
+        target = next((p for p in files if p.stem == kind), None)
+        if not target:
+            avail = ", ".join(p.stem for p in files) or "(없음)"
+            _fail(f"{module}: contracts/{kind}.yaml 없음 — 있는 계약: {avail}")
+        sys.stdout.write(target.read_text(encoding="utf-8"))
+        return
+    typer.secho(f"{module} 계약 표면 (envs/{ws.env}, read-only — 운반·노출만):", bold=True)
+    if not files:
+        typer.secho("  (contracts/ 비어 있음)", dim=True)
+    for p in files:
+        typer.secho(f"  ✓ {p.stem}", fg=OK)
+        typer.secho(f"      {p}", dim=True)
+    typer.secho(f"  내용: bee contracts {module} --kind <{'|'.join(p.stem for p in files) or 'openapi|asyncapi'}>", dim=True)
 
 
 @app.command()
