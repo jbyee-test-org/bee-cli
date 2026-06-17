@@ -247,10 +247,10 @@ def _migrations_hash(mdir: Path) -> str:
 
 
 def _module_uses(spec: dict) -> set[str]:
-    """모듈이 *사용*하는 substrate capability — 논리 어휘(db/events/routing)에서 **파생**(G36).
-    명시 `uses` 필드(외부 인프라 btc 등 어휘 미덮)는 G28 ② 연기분 — 파생이지 신규 모듈 어휘 0."""
+    """모듈이 *사용*하는 substrate capability — 논리 어휘(db/routing)에서 **파생**(G36).
+    events 는 접속형으로 걷어내(G42) 어휘 없음 → capability 파생 대상 아님. btc 등 접속형도 어휘 미덮(G41)."""
     s = spec or {}
-    return {cap for cap in ("db", "events", "routing") if s.get(cap)}
+    return {cap for cap in ("db", "routing") if s.get(cap)}
 
 
 def _all_specs(overrides: dict[str, Path], snaps: dict) -> dict[str, "resolver.ModuleSpec"]:
@@ -712,7 +712,7 @@ def doctor_impl(*, remote_ok: bool = False) -> int:
         return _doctor_summary(tally)
     try:
         ws = wsm.load_workspace(root)
-        rep("ok", f"bee.workspace.yaml — env={ws.env}, platform={ws.platform or '-'}")
+        rep("ok", f"bee.workspace.yaml — env={ws.env}")
     except Exception as e:
         rep("fail", f"워크스페이스 파싱 실패 — {e}")
         return _doctor_summary(tally)
@@ -730,10 +730,12 @@ def doctor_impl(*, remote_ok: bool = False) -> int:
     try:
         p = wsm.platform_yaml_path(ws, root)
         if p:
-            sup = ((_yaml_at(p).get("spec") or {}).get("chart") or {}).get("supported", "?")
-            rep("ok", f"platform.yaml: {ws.platform} (supported {sup})")
+            pdoc = _yaml_at(p)
+            pname = (pdoc.get("metadata") or {}).get("name", "?")   # G43: 이름은 디스크립터 metadata.name
+            sup = ((pdoc.get("spec") or {}).get("chart") or {}).get("supported", "?")
+            rep("ok", f"platform.yaml: {pname} (supported {sup})")
         else:
-            rep("warn", "platform 미선언 — namespace 룩업·지원 범위 검사 생략")
+            rep("warn", "platform.yaml 없음(core-infra 루트) — namespace 룩업·지원 범위 검사 생략")
     except Exception as e:
         rep("fail", f"platform.yaml — {e}")
 
@@ -824,6 +826,17 @@ def doctor_impl(*, remote_ok: bool = False) -> int:
                     rep("warn", f"{n}: uses {{{', '.join(sorted(cmiss))}}} ⊄ provides — 플랫폼 미제공(substrate)")
                 elif uses:
                     rep("ok", f"{n}: capability {{{', '.join(sorted(uses))}}} ⊆ provides")
+                # G44 db 코덱 — db.target ∈ provides.db[].target (multi-target dispatch · 기본값 없음)
+                dbspec = spec.get("db") or {}
+                if dbspec:
+                    dt = dbspec.get("target")
+                    dtargets = {e.get("target") for e in (provides.get("db") or []) if isinstance(e, dict)}
+                    if not dt:
+                        rep("warn", f"{n}: db.target 미선언 — psql|mysql 명시 필수(G44, 기본값 없음)")
+                    elif dt not in dtargets:
+                        rep("warn", f"{n}: db.target {dt!r} ∉ provides.db {{{', '.join(sorted(t for t in dtargets if t))}}}")
+                    else:
+                        rep("ok", f"{n}: db.target {dt} ⊆ provides.db")
                 # G37 리소스 프로파일
                 u = spec.get("uses") or {}
                 rmiss, have = [], []
@@ -1041,7 +1054,7 @@ _WORKSPACE_TEMPLATE = """\
 # 플랫폼 메인테이너(core-infra 직접 편집)면 repo/ref → path: repos/core-infra 로 바꾼다.
 version: 1
 snapshot:  { repo: "https://github.com/CHANGEME-ORG/bee-snapshot.git", env: dev, ref: main }
-coreInfra: { repo: "https://github.com/CHANGEME-ORG/bee-core-infra.git", ref: main, platform: CHANGEME, chartRef: "oci://ghcr.io/CHANGEME-ORG/charts/bee-module" }
+coreInfra: { repo: "https://github.com/CHANGEME-ORG/bee-core-infra.git", ref: main, chartRef: "oci://ghcr.io/CHANGEME-ORG/charts/bee-module" }   # core-infra = 1 플랫폼(G43); 이름은 platform.yaml metadata.name
 cluster: { context: kind-bee-local }                       # 인너루프 kubectl 컨텍스트(G7 — 공유환경 금지)
 # 빌드 사설 registry(G30) — 토큰은 bee.secrets.local.yaml[tokenEnv](또는 실제 env)에서 해석.
 buildRegistries: []
@@ -1064,7 +1077,7 @@ def init():
     `bee substrate up` → `bee pull <module>` → `bee up`. core-infra·snapshot 은 원격에서 읽는다(클론 불요)."""
     cwd = Path.cwd()
     for fname, tmpl, hint in [
-        (wsm.WORKSPACE_FILE, _WORKSPACE_TEMPLATE, "coreInfra.platform·local 등록을 채워라"),
+        (wsm.WORKSPACE_FILE, _WORKSPACE_TEMPLATE, "core-infra/snapshot URL·local 등록을 채워라"),
         (wsm.SECRETS_FILE, _SECRETS_TEMPLATE, "빌드 토큰 등을 채워라(커밋 금지)"),
     ]:
         f = cwd / fname

@@ -74,6 +74,9 @@ class Model:
             self.order, self.missing = res.order, res.missing
         self.backdrop = [n for n in self.order if n not in self.overrides]
         self.products = cli._products(ws, root)
+        # 플랫폼명 = platform.yaml metadata.name(G43 — core-infra = 1 플랫폼, 워크스페이스 바인딩에 platform 없음)
+        pyaml = wsm.platform_yaml_path(ws, root)
+        self.platform = (cli._yaml_at(pyaml).get("metadata") or {}).get("name") if pyaml else None
         # 좌표(product→ns) + 배포 상태(모듈별 namespace 의 Deployment 존재 여부)
         self.coords: dict[str, str] = {}
         self.deployed: set[str] = set()
@@ -105,7 +108,7 @@ class Model:
 def orient(m: Model):
     up_n = len(m.deployed)
     typer.echo()
-    typer.echo(f"  {s('❯', dim=True)} {s(m.ws.platform or '(플랫폼 미지정)', bold=True)} · "
+    typer.echo(f"  {s('❯', dim=True)} {s(m.platform or '(플랫폼 미지정)', bold=True)} · "
                f"{s('local', fg=LOCAL)}        {s('cluster: ' + (m.ws.cluster_context or '?'), dim=True)}")
     typer.echo("  " + s("─" * 62, dim=True))
     typer.echo(f"  {s('snapshot', dim=True)} {s('envs/' + m.ws.env + ' @' + (m.pin or '미pin'), dim=True)}    "
@@ -340,7 +343,7 @@ class BeeApp(App[None]):
         up_n, idle = len(m.deployed), len(m.order) - len(m.deployed)
         pin = "@" + m.pin if m.pin else "미pin"
         self.query_one("#ctx", Static).update(
-            f"[dim]platform[/] [b]{m.ws.platform or '(미지정)'}[/]    "
+            f"[dim]platform[/] [b]{m.platform or '(미지정)'}[/]    "
             f"[dim]cluster[/] [b]{m.ws.cluster_context or '?'}[/]\n"
             f"[dim]snapshot[/] envs/{m.ws.env} [b]{pin}[/]    [dim]render env[/] local\n"
             f"[dim]plan[/] [green]● {up_n} up[/][dim] · ○ {idle} idle[/]\n"

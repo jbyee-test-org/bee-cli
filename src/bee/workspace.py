@@ -7,7 +7,7 @@
     bee.workspace.yaml
       version: 1
       snapshot: { repo: <경로|URL>, env: dev, ref: main }   # backdrop baseline (규칙 7 — 경계 dev)
-      coreInfra: { path: <경로|URL>, platform: bitcert }     # chart·starter·platform.yaml 1-바인딩 (G5)
+      coreInfra: { path: <경로|URL> }                        # chart·starter·platform.yaml 1-바인딩 (G5; core-infra=1 플랫폼 G43)
       cluster: { context: kind-bee-local }                   # 인너루프 클러스터 (G7 — 공유환경 금지)
       local:
         hello: { path: repos/hello }
@@ -35,8 +35,8 @@ import yaml
 WORKSPACE_FILE = "bee.workspace.yaml"
 SECRETS_FILE = "bee.secrets.local.yaml"   # 워크스페이스-스코프 시크릿(빌드 토큰 등). gitignore — 커밋 금지(G31).
 LOCK_FILE = ".bee/workspace.lock.yaml"
-PLATFORMS_DIR = "platforms"  # core-infra 안의 디스크립터 홈: <core-infra>/platforms/<name>/platform.yaml
-CHART_DIR = "chart"          # core-infra 안의 공용 차트
+PLATFORM_YAML = "platform.yaml"  # 디스크립터 홈 = core-infra 루트(G43 — core-infra = 1 플랫폼, 이름은 metadata.name)
+CHART_DIR = "chart"              # core-infra 안의 공용 차트
 
 
 class WorkspaceError(RuntimeError):
@@ -59,7 +59,6 @@ class Workspace:
     core_infra: str | None = None        # 로컬 경로(메인테이너 — 직접 편집) (G5 — 1-바인딩)
     core_infra_repo: str | None = None   # git URL(소비 — 원격 fetch, work tree 미보유). path 와 양자택일
     core_infra_ref: str = "main"         # core_infra_repo 의 ref(브랜치=floating·40-hex=pin, 규칙 8)
-    platform: str | None = None          # platforms/<name>/platform.yaml
     chart_ref: str | None = None         # oci://… — 있으면 OCI 소비(G6), 모듈 pin 이 --version
     cluster_context: str | None = None   # 인너루프 클러스터 kubectl 컨텍스트 (G7)
     locals: dict[str, LocalOverride] = field(default_factory=dict)
@@ -83,15 +82,13 @@ class Workspace:
         doc: dict = {"version": 1, "snapshot": {"env": self.env, "ref": self.snapshot_ref}}
         if self.snapshot_repo:
             doc["snapshot"]["repo"] = self.snapshot_repo
-        if self.core_infra or self.core_infra_repo or self.platform:
+        if self.core_infra or self.core_infra_repo:
             ci: dict = {}
             if self.core_infra_repo:
                 ci["repo"] = self.core_infra_repo
                 ci["ref"] = self.core_infra_ref
             elif self.core_infra:
                 ci["path"] = self.core_infra
-            if self.platform:
-                ci["platform"] = self.platform
             if self.chart_ref:
                 ci["chartRef"] = self.chart_ref
             doc["coreInfra"] = ci
@@ -122,7 +119,6 @@ class Workspace:
             core_infra=ci.get("path"),
             core_infra_repo=ci.get("repo"),
             core_infra_ref=ci.get("ref", "main"),
-            platform=ci.get("platform"),
             chart_ref=ci.get("chartRef"),
             cluster_context=(data.get("cluster") or {}).get("context"),
             locals=locals_,
@@ -252,13 +248,10 @@ def chart_dir(ws: Workspace, root: Path) -> Path:
 
 
 def platform_yaml_path(ws: Workspace, root: Path) -> Path | None:
-    """플랫폼 디스크립터 경로. platform 미선언이면 None(검사 생략), 선언했는데 없으면 오류."""
-    if not ws.platform:
-        return None
-    p = core_infra_dir(ws, root) / PLATFORMS_DIR / ws.platform / "platform.yaml"
-    if not p.exists():
-        raise WorkspaceError(f"디스크립터 없음: {p} — coreInfra.platform 확인")
-    return p
+    """플랫폼 디스크립터 경로 = core-infra 루트의 platform.yaml(G43 — core-infra = 1 플랫폼,
+    이름은 디스크립터의 metadata.name). 없으면 None(검사 생략 — 디스크립터 없는 core-infra 도 허용)."""
+    p = core_infra_dir(ws, root) / PLATFORM_YAML
+    return p if p.exists() else None
 
 
 def snapshot_repo_dir(ws: Workspace, root: Path) -> Path:
