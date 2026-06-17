@@ -33,10 +33,21 @@ substrate_app = typer.Typer(no_args_is_help=True, help="substrate(infra) 적용 
 app.add_typer(substrate_app, name="substrate")
 
 
+def _version_callback(value: bool) -> None:
+    if value:
+        from importlib.metadata import version as _pkg_version
+
+        typer.echo(f"bee {_pkg_version('bee-cli')}")
+        raise typer.Exit()
+
+
 @app.callback(invoke_without_command=True)
 def main(
     ctx: typer.Context,
     interactive: bool = typer.Option(False, "-i", "--interactive", help="대화형 REPL"),
+    version: bool = typer.Option(
+        False, "--version", "-V", help="버전 출력 후 종료", callback=_version_callback, is_eager=True
+    ),
 ):
     """bee — thin CLI. 커맨드: render·build·up·down·status (Phase 1)."""
     if interactive and ctx.invoked_subcommand is None:
