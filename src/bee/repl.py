@@ -116,6 +116,10 @@ def orient(m: Model):
     typer.echo(f"  {s('snapshot', dim=True)} {s('envs/' + m.ws.env + ' @' + (m.pin or '미pin'), dim=True)}    "
                f"{s('plan', dim=True)} {s('● ' + str(up_n) + ' up', fg=OK)} "
                f"{s('· ' + str(len(m.order) - up_n) + ' idle', dim=True)}")
+    bs = cli._branch_scope(m.ws)   # ref 스코프(G50) — 브랜치 활성 시 경고 표시(인너루프 전용)
+    if bs:
+        typer.echo("  " + s("⚠ ref 스코프: " + " · ".join(f"{l}@{r}" for l, r in bs)
+                            + "  (인너루프 미병합 통합 · 공유=main · bee ref --reset)", fg=WARN))
     typer.echo(f"\n  {s('편집 표면', fg=LOCAL)} {s('(from-local — 멤버십, 규칙 5)', dim=True)}")
     for name in sorted(m.overrides):
         typer.echo(f"    {m.badge(name)}  {s('✎ ' + name, fg=LOCAL)}   "
@@ -412,13 +416,16 @@ class BeeApp(App[None]):
         m, marked = self.model, len(self.marked)
         up_n, idle = len(m.deployed), len(m.order) - len(m.deployed)
         pin = "@" + m.pin if m.pin else "미pin"
+        bs = cli._branch_scope(m.ws)   # ref 스코프(G50) — 브랜치 활성 시 헤더 경고(인너루프 전용)
+        ref_line = ("\n[yellow]⚠ ref " + " · ".join(f"{l}@{r}" for l, r in bs)
+                    + " (미병합 통합 · 공유=main · bee ref --reset)[/]") if bs else ""
         self.query_one("#ctx", Static).update(
             f"[dim]platform[/] [b]{m.platform or '(미지정)'}[/]    "
             f"[dim]cluster[/] [b]{m.ws.cluster_context or '?'}[/]\n"
             f"[dim]snapshot[/] envs/{m.ws.env} [b]{pin}[/]    [dim]render env[/] local\n"
             f"[dim]plan[/] [green]● {up_n} up[/][dim] · ○ {idle} idle[/]\n"
             f"[dim]surface[/] [cyan]✎ {len(m.overrides)} local[/][dim] · {len(m.backdrop)} backdrop[/]"
-            f"    [dim]marked[/] [b]{marked}[/]"
+            f"    [dim]marked[/] [b]{marked}[/]" + ref_line
         )
 
     def _sel_cell(self, name: str) -> Text:

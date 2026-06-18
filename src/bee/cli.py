@@ -350,13 +350,21 @@ def _snapshot_path(root: Path, ws: wsm.Workspace) -> Path:
 
 
 def _write_lock(root: Path, ws: wsm.Workspace, overrides: dict[str, Path]) -> str:
-    """up 이 snapshot SHA + local 커밋을 pin (규칙 8). Phase 1 은 기록 — refresh 의미는 Phase 2."""
+    """up 이 snapshot + **coreInfra**(G50 대칭) SHA + local 커밋을 pin (규칙 8).
+    **재현성 앵커**: ref 가 브랜치여도(미병합 통합, G50) 해석된 commit 을 lock 에 박는다 —
+    브랜치는 fetch 출처일 뿐, lock 의 commit 이 재현 기준(브랜치 움직여도 명시 재-up 까지 고정)."""
     snap_path = _snapshot_path(root, ws)
     commit = kube.git(["rev-parse", "HEAD"], snap_path)
     lock: dict = {
         "snapshot": {"repo": ws.snapshot_repo, "env": ws.env, "ref": ws.snapshot_ref, "commit": commit},
         "local": {},
     }
+    try:  # coreInfra 핀(G50 ② — substrate/chart 도 브랜치 ref 활성 시 commit 앵커). path/URL 공용.
+        ci_commit = kube.git(["rev-parse", "HEAD"], wsm.core_infra_dir(ws, root))
+        lock["coreInfra"] = {"repo": ws.core_infra_repo or ws.core_infra,
+                             "ref": ws.core_infra_ref, "commit": ci_commit}
+    except Exception:
+        pass  # coreInfra 미해석(OCI-only 등) — 핀 생략(snapshot 만)
     for name, p in sorted(overrides.items()):
         lock["local"][name] = {
             "path": str(p),
@@ -367,6 +375,82 @@ def _write_lock(root: Path, ws: wsm.Workspace, overrides: dict[str, Path]) -> st
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_text(yaml.safe_dump(lock, sort_keys=False, allow_unicode=True), encoding="utf-8")
     return commit
+
+
+# ── ref 스코프 (G50 — 인너루프 미병합 통합) ─────────────────────────────────────
+def _ls_remote(url: str | None, ref: str) -> str:
+    """원격 ref → commit(40-hex). SHA 면 그대로 · 브랜치면 ls-remote. 실패/오프라인=‘?’."""
+    import re
+    if not url:
+        return "?"
+    if re.fullmatch(r"[0-9a-f]{40}", ref or ""):
+        return ref
+    r = kube.run(["git", "ls-remote", url, ref], check=False)
+    return r.stdout.split()[0] if r.stdout.strip() else "?"
+
+
+def _branch_scope(ws: wsm.Workspace) -> list[tuple[str, str]]:
+    """현재 브랜치-스코프(ref≠main, URL 바인딩) 목록 → [(label, ref)]. 가시성 공용(doctor·orient)."""
+    out = []
+    for label, repo, ref in (("snapshot", ws.snapshot_repo, ws.snapshot_ref),
+                             ("coreInfra", ws.core_infra_repo, ws.core_infra_ref)):
+        if wsm._is_url(repo) and ref and ref != "main":
+            out.append((label, ref))
+    return out
+
+
+def _ref_show(ws: wsm.Workspace) -> None:
+    typer.secho("ref 스코프 (G50 — 인너루프 미병합 통합)", bold=True)
+    any_branch = False
+    for label, repo, ref in (("snapshot", ws.snapshot_repo, ws.snapshot_ref),
+                             ("coreInfra", ws.core_infra_repo or ws.core_infra, ws.core_infra_ref)):
+        if not wsm._is_url(repo):
+            typer.secho(f"  {label:9} {ref or 'main':14} [로컬 경로 — ref 무관(git checkout)]", dim=True)
+            continue
+        commit = _ls_remote(repo, ref)
+        if ref == "main":
+            typer.secho(f"  {label:9} {ref:14} → {commit[:7]}", fg=OK)
+        else:
+            any_branch = True
+            main_c = _ls_remote(repo, "main")
+            delta = "" if commit == main_c else f"  (main {main_c[:7]} 과 다름)"
+            typer.secho(f"  {label:9} {ref:14} → {commit[:7]}  ⚠ 브랜치 스코프{delta}", fg=WARN)
+    if any_branch:
+        typer.secho("  ⚠ 인너루프 전용 — 공유 ArgoCD 는 main 고정(규칙 7). 재현 앵커=lock commit(규칙 8). 복귀: bee ref --reset", fg=WARN)
+    else:
+        typer.secho("  공유 baseline(main) — 미병합 통합 없음", dim=True)
+
+
+def ref_impl(ref: str | None, root: Path, ws: wsm.Workspace, *,
+             snapshot: bool = False, core_infra: bool = False, reset: bool = False) -> None:
+    """ref 스코프(G50) — substrate/snapshot 을 main 아닌 브랜치 ref 에서 *인너루프* 소비(미병합 통합).
+    **불가침**: ① 인너루프 전용(공유 ArgoCD=main 고정, 규칙 7) · ② 재현=lock commit(브랜치는 fetch 출처) ·
+    ③ ephemeral(--reset 원턴 복귀) · ④ branch ⊥ env(ref 는 dev 라인, env=dir 배포대상 — 안 겹침)."""
+    if reset:
+        ws.snapshot_ref = ws.core_infra_ref = "main"
+        wsm.save_workspace(root, ws)
+        _ok("ref → main 복귀(snapshot·coreInfra) — baseline. 적용·재-pin: `bee up`/`bee substrate up`.")
+        _ref_show(ws)
+        return
+    if not ref:
+        _ref_show(ws)
+        return
+    targets = [t for t, on in (("snapshot", snapshot), ("coreInfra", core_infra)) if on]
+    if not targets:
+        _fail("대상 명시 — -s/--snapshot · -c/--core-infra (둘 다 가능). ref 는 *미병합 통합* 대상(G50).")
+    for t in targets:
+        repo = ws.snapshot_repo if t == "snapshot" else ws.core_infra_repo
+        if not wsm._is_url(repo):
+            _fail(f"{t} 바인딩이 로컬 경로 — ref 스코프는 **URL 소비 모드 전용**(G50). "
+                  f"경로 메인테이너는 git checkout 으로 브랜치 전환(솔로는 그걸로 충분).")
+    if snapshot:
+        ws.snapshot_ref = ref
+    if core_infra:
+        ws.core_infra_ref = ref
+    wsm.save_workspace(root, ws)
+    _ok(f"ref 설정: {' · '.join(targets)} → {ref} (미병합 통합 — 인너루프 전용 G50)")
+    _warn("공유 배포 영향 없음(ArgoCD=main 고정, 규칙 7). 적용: `bee up`/`bee substrate up`(lock 이 commit 앵커). 복귀: `bee ref --reset`.")
+    _ref_show(ws)
 
 
 # ── impl (커맨드·REPL 공용) ────────────────────────────────────────────────────
@@ -927,6 +1011,15 @@ def doctor_impl(*, remote_ok: bool = False) -> int:
         rep("warn", "imageRegistry 없음 — image 모듈 build --push·render 막힘. "
                     "bee.workspace.yaml 에 `imageRegistry: <registry>`(G54)")
 
+    # ref 스코프(G50) — 브랜치 ref 활성 시 *항상 보이게*(가시성 = "적용 전에 본다"). 인너루프 전용.
+    bs = _branch_scope(ws)
+    if bs:
+        rep("warn", "ref 스코프 활성(인너루프 미병합 통합, G50): "
+                    + " · ".join(f"{l}@{r}" for l, r in bs)
+                    + " — 공유 ArgoCD 는 main 고정(규칙 7). `bee ref` 로 상세, `bee ref --reset` 로 복귀")
+    else:
+        rep("ok", "ref 스코프: main baseline (미병합 통합 없음, G50)")
+
     overrides: dict = {}
     try:
         overrides = wsm.override_dirs(ws, root)
@@ -1199,6 +1292,22 @@ def status():
     """스냅샷 pin vs HEAD — 내 서브그래프 변경만 보고(규칙 8). 자동폴링 없음."""
     root, ws = load_ctx()
     status_impl(root, ws)
+
+
+@app.command()
+def ref(
+    ref: str = typer.Argument(None, help="브랜치/SHA — 미지정=현재 ref 스코프 상태 표시"),
+    snapshot: bool = typer.Option(False, "-s", "--snapshot", help="snapshot.ref 대상"),
+    core_infra: bool = typer.Option(False, "-c", "--core-infra", help="coreInfra.ref(substrate/chart) 대상"),
+    reset: bool = typer.Option(False, "--reset", help="snapshot·coreInfra 둘 다 main 복귀(원턴, ephemeral G50)"),
+):
+    """ref 스코프(G50) — **인너루프 미병합 통합**: substrate/snapshot 을 main 아닌 브랜치 ref 에서 소비
+    (병합 전 남의 substrate/모듈 변경에 내 모듈을 통합·확인). **인너루프 전용**(공유 ArgoCD=main 고정, 규칙 7) ·
+    재현=lock commit(규칙 8) · ephemeral(--reset). URL 소비 모드 전용(경로는 git checkout).
+
+    `bee ref` 상태 · `bee ref <br> -s`/`-c` 설정 · `bee ref --reset` 복귀."""
+    root, ws = load_ctx()
+    ref_impl(ref, root, ws, snapshot=snapshot, core_infra=core_infra, reset=reset)
 
 
 @app.command()
