@@ -230,7 +230,10 @@ def _fallback_repl(root: Path):
             typer.secho(f"⚠ {e}", fg=WARN, err=True)
             return
         orient(m)
-        typer.echo("\n  " + s("1 up · 2 build · 3 down · 4 status · snap · pull · q quit", dim=True))
+        menu = "1 up · 2 build · 3 down · 4 status · snap · pull"
+        if cli._branch_scope(ws):   # 브랜치-스코프일 때만 ref-reset 노출(G50 ③ — 이탈 원키)
+            menu += " · " + s("ref-reset", fg=WARN)
+        typer.echo("\n  " + s(menu, dim=True) + s(" · q quit", dim=True))
         try:
             ch = input("bee ▸ ").strip().lower()
         except EOFError:
@@ -261,6 +264,11 @@ def _fallback_repl(root: Path):
                 sel = sorted(_checklist_numbered("pull ▸ backdrop → 편집 표면", items)) if items else []
                 if sel and confirm(f"bee pull {' '.join(sel)}"):
                     cli.pull_impl(sel, root, ws)
+            elif ch in ("ref-reset", "reset"):
+                if cli._branch_scope(ws) and confirm("bee ref --reset"):
+                    cli.ref_impl(None, root, ws, reset=True)   # G50 ③ ephemeral — 이탈
+                elif not cli._branch_scope(ws):
+                    typer.echo("  " + s("ref 스코프 아님 — main baseline(진입은 bee ref CLI)", dim=True))
             elif ch:
                 typer.echo("  " + s("? 모르는 액션: " + ch, dim=True))
         except typer.Exit:
@@ -363,6 +371,7 @@ class BeeApp(App[None]):
         Binding("r", "reload", "refresh"),
         Binding("p", "snap", "snap"),
         Binding("e", "pull", "pull"),
+        Binding("g", "ref_reset", "ref→main"),   # 브랜치-스코프일 때만 노출(check_action, G50 ③ ephemeral)
         Binding("q", "quit", "quit"),
         Binding("j", "row_down", "down", show=False),
         Binding("k", "row_up", "up", show=False),
@@ -396,7 +405,12 @@ class BeeApp(App[None]):
         self._load_model(first=True)
 
     def check_action(self, action: str, parameters):  # 모달 위에서는 앱 단축키 잠금
-        return len(self.screen_stack) <= 1
+        if len(self.screen_stack) > 1:
+            return False
+        # ref→main 복귀는 *브랜치-스코프 활성일 때만* 노출(컨텍스트 액션, G50 — 이탈은 원키·진입은 CLI)
+        if action == "ref_reset":
+            return bool(self.ws and cli._branch_scope(self.ws))
+        return True
 
     # ── 모델/화면 갱신 (오리엔트 복귀 = 이 함수) ─────────────────────────────────
     def _load_model(self, first: bool = False):
@@ -615,6 +629,22 @@ class BeeApp(App[None]):
             ConfirmScreen("snap — 스냅샷 SoT 쓰기", body, equiv),
             lambda ok: self._run_suspended(
                 equiv, lambda: cli.snap_impl(env, names, self.root, self.ws)) if ok else None,
+        )
+
+    def action_ref_reset(self):
+        # G50 ③ ephemeral — 브랜치-스코프 이탈(원키). 진입(set)은 CLI(deliberate, 헤더가 힌트).
+        bs = cli._branch_scope(self.ws)
+        if not bs:
+            self.notify("ref 스코프 아님 — main baseline(G50). 진입: bee ref <br> -s/-c (CLI)", severity="information")
+            return
+        body = ("[yellow]ref 스코프 → main 복귀[/] — 인너루프 미병합 통합 종료.\n"
+                + "\n".join(f"[yellow]⚠ {l}@{r}[/] → main" for l, r in bs)
+                + "\n\n[dim]ephemeral(G50 ③) — baseline 으로. 적용·재-pin: bee up / bee substrate up[/]")
+        equiv = "bee ref --reset"
+        self.push_screen(
+            ConfirmScreen("ref — main 복귀", body, equiv, tone="warn"),
+            lambda ok: self._run_suspended(
+                equiv, lambda: cli.ref_impl(None, self.root, self.ws, reset=True)) if ok else None,
         )
 
     def action_pull(self):
