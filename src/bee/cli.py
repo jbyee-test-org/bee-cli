@@ -409,7 +409,8 @@ def build_push_impl(names: list[str], root: Path, ws: wsm.Workspace, env: str) -
         digest = kube.docker_push(tag)
         _ok(f"{name}: build+push → {tag}")
         typer.secho(f"     digest: {digest}", fg=OK, bold=True)
-        typer.secho(f"     다음: gh workflow run publish-dev.yaml -f digest={digest}  (CI publish, env={env})", dim=True)
+        # 다음 = bee snap(원격 모드면 bee 가 CI dispatch 흡수 — 사용자는 gh 안 침, G53).
+        typer.secho(f"     다음: bee snap -e {env} {name} --digest {digest}", dim=True)
 
 
 def _apply_local_secrets(name: str, mdir: Path, ns: str, ctx: str) -> None:
@@ -557,19 +558,108 @@ def status_impl(root: Path, ws: wsm.Workspace) -> None:
         _ok(f"pin {pin[:7]} ≠ HEAD {head[:7]} 이나 내 서브그래프 변경 없음 — 무관 churn 무시(규칙 8)")
 
 
-def snap_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Workspace, *,
-              digest: str = "", push: bool = False) -> None:
-    """스냅샷 SoT 에 env 엔트리 쓰기(G52) — **배포 아님**(배포=ArgoCD, `bee sync`). 검증은 CI 게이트1(규칙 2).
+def _module_repo_slug(mdir: Path) -> str | None:
+    """모듈 git origin → 'owner/repo' (gh dispatch 대상). 없으면 None.
+    https://github.com/owner/repo(.git) · git@github.com:owner/repo(.git) 둘 다."""
+    import re as _re
+    url = kube.git(["remote", "get-url", "origin"], mdir)
+    if not url:
+        return None
+    m = _re.search(r"[:/]([^/:]+/[^/:]+?)(?:\.git)?/?$", url.strip())
+    return m.group(1) if m else None
 
-    **핀 출처 = platform.envs 사다리 순서로 자동**:
-      · 맨 앞 env(dev) = 진입 → 핀 = `--digest`(로컬 빌드, 새 핀 *생성*).
-      · 그 다음 env(prod) = 전진 → 핀 = *앞 env* provenance 복사(같은 아티팩트 — *승격*). `--digest` 면 우회(경고).
-    **env 별 독립 핀**(prod 는 dev 가 앞서가도 복사 시점 유지). 공유 env 전용(규칙 7 — 인너는 bee up).
-    렌더 입력(module.yaml·values-<env>)은 로컬 편집표면(Tier 1; 순수형은 앞-env 스냅샷 직접 렌더 = refinement).
-    쓰기 게이트: dev=CI직접·prod=PR(G8). (구 publish + promote 통합 — G52.)
+
+# 모듈 thin caller(starter) 규약 — bee snap(원격 모드)이 dispatch 하는 publish 워크플로 파일명(G53).
+PUBLISH_WORKFLOW = "publish-{env}.yaml"
+
+
+def _digest_preflight(name: str, mdir: Path, env: str, digest: str) -> None:
+    """phantom pin 방어(G53) — 핀할 digest 가 registry 에 *실재*하는지 best-effort 확인(local-path 모드).
+    `docker manifest inspect {registry}/{image}@{digest}`(로컬 docker 자격증명 사용). 실패는 **경고만**(규칙 2 —
+    하드 게이트는 CI gate1 의 crane 체크). 인증·네트워크 미비로도 실패할 수 있어 차단하지 않는다(false-negative 회피)."""
+    if not digest:
+        return
+    registry, image = _image_ref(mdir, env)
+    if not registry or not image:
+        return
+    ref = f"{registry}/{image}@{digest}"
+    if kube.run(["docker", "manifest", "inspect", ref], check=False).returncode != 0:
+        _warn(f"{name}: digest 미확인 — `docker manifest inspect {ref}` 실패. registry 에 없으면 phantom pin"
+              f"(→ ImagePullBackOff). 인증/네트워크 문제일 수도(경고만, 하드 게이트는 CI gate1).")
+
+
+def snap_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Workspace, *,
+              digest: str = "") -> None:
+    """스냅샷 SoT 에 env 엔트리 쓰기 — **배포 아님**(배포=ArgoCD, `bee sync`). 검증은 CI 게이트1(규칙 2).
+
+    **모드 자동 분기(G53 — 사용자는 bee 만, `gh` 직접 안 침)** = snapshot 바인딩 종류:
+      · **원격(`snapshot.repo`=URL)** = GitOps → bee 가 모듈 publish 워크플로를 *dispatch*(`gh workflow run`).
+        CI 가 render+gate1(+digest 존재 게이트)+push 의 **게이트된 쓰기**를 한다(규칙 2). bee=트리거.
+      · **local-path(`snapshot.repo`=경로)** = 솔로 부트스트랩 → bee 가 직접 render+write+commit+push
+        (GitOps/CI 없음 — 게이트는 부트스트랩 특성상 생략, digest 존재만 best-effort 프리플라이트).
+
+    **핀 출처 = platform.envs 사다리 자동**: 맨 앞(dev)=`--digest` 빌드 핀 *생성* · 다음(prod)=앞 env
+    provenance 의 imageDigest *복사*(전진/승격, 같은 아티팩트). env 별 독립 핀. 공유 env 전용(규칙 7).
+    쓰기 게이트: dev=CI직접·prod=PR(G8). (구 publish + promote 통합 — G52; dispatch 흡수 — G53.)
     """
     if env == "local":
         _fail("snap 은 공유 env 전용 — 로컬은 SoT 밖(규칙 7). 인너루프는 bee up.")
+    if wsm._is_url(ws.snapshot_repo):
+        _snap_dispatch(env, targets, root, ws, digest=digest)
+    else:
+        _snap_local(env, targets, root, ws, digest=digest)
+
+
+def _snap_dispatch(env: str, targets: list[str] | None, root: Path, ws: wsm.Workspace, *,
+                   digest: str = "") -> None:
+    """원격(GitOps) 모드 snap — bee 가 모듈 publish 워크플로 dispatch(G53). 사용자가 `gh workflow run`·
+    snapshot 레포를 직접 안 건드린다 — bee 가 트리거하고, **게이트된 쓰기**(render+gate1+push)는 CI 가
+    한다(규칙 2 — 검증은 CI). bee 는 *렌더 안 함*(원격 snapshot 캐시는 pin 된 읽기 전용, 규칙 8)."""
+    import shutil
+
+    if env != "dev":
+        _fail(f"원격 snap 은 현재 dev 만(승격 사다리 맨 앞, 핀 생성) — prod dispatch 는 Tier 2(라이브 prod·app-prod, "
+              f"PR 게이트 G8). 로컬 부트스트랩 승격은 snapshot.repo 를 path 로.")
+    if not shutil.which("gh"):
+        _fail("gh 없음 — 원격 snap 은 GitHub CLI 로 워크플로 dispatch(사용자는 bee 만, G53). "
+              "`brew install gh` 후 `gh auth login`.")
+    overrides = wsm.override_dirs(ws, root)
+    names = targets or sorted(overrides)
+    unknown = [n for n in names if n not in overrides]
+    if unknown:
+        _fail(f"snap 은 편집 표면(from-local) 전용(규칙 5): {', '.join(unknown)} (pull/new 로 등록)")
+    if digest and len(names) != 1:
+        _fail("--digest 는 모듈 1개와 함께만 (모듈별 digest 가 다르다)")
+    wf = PUBLISH_WORKFLOW.format(env=env)
+    for name in names:
+        mdir = overrides[name]
+        slug = _module_repo_slug(mdir)
+        if not slug:
+            _fail(f"{name}: git origin 없음 — dispatch 대상 레포 미상(repos/{name} 에 origin remote 필요, G3)")
+        if _has_image(mdir) and not digest:
+            _fail(f"{name}: image 모듈인데 --digest 없음 — 빌드는 로컬(G33). 먼저 "
+                  f"`bee build -e {env} {name} --push` → digest → `bee snap -e {env} {name} --digest <D>`.")
+        # CI 가 모듈 default 브랜치를 체크아웃한다(workflow_dispatch). 로컬 HEAD 가 origin 에 안 올라가 있으면
+        # provenance.moduleCommit 이 어긋난다(정합 #2) — 차단 아닌 경고(push 는 사용자 git 책임).
+        if kube.git(["rev-list", "@{u}..HEAD"], mdir):
+            _warn(f"{name}: 로컬 커밋이 origin 에 미푸시 — CI 는 origin default 를 체크아웃(moduleCommit 어긋남). "
+                  f"`git -C repos/{name} push` 후 dispatch 권장.")
+        cmd = ["gh", "-R", slug, "workflow", "run", wf]
+        if digest:
+            cmd += ["-f", f"digest={digest}"]
+        typer.secho(f"CI dispatch → {slug} {wf}"
+                    + (f" (digest {digest[:23]}…)" if digest else " (image-less, G21)"), bold=True)
+        kube.run(cmd)
+        _ok(f"{name}: publish 워크플로 dispatch — CI 가 render+gate1+push(게이트된 쓰기, 규칙 2). "
+            f"진행: gh -R {slug} run list")
+    typer.secho(f"  배포는 CI push 완료 후 `bee sync {env}`(manual — 배포 게이트, G53).", dim=True)
+
+
+def _snap_local(env: str, targets: list[str] | None, root: Path, ws: wsm.Workspace, *,
+                digest: str = "") -> None:
+    """local-path(솔로 부트스트랩) 모드 snap — bee 가 직접 render+write+commit+push(G53).
+    GitOps/CI 없음(부트스트랩 특성 — 게이트1 생략). digest 존재는 best-effort 프리플라이트(phantom pin 경고).
+    렌더 입력(module.yaml·values-<env>)은 로컬 편집표면(Tier 1; 순수형은 앞-env 스냅샷 직접 렌더 = refinement)."""
     overrides = wsm.override_dirs(ws, root)
     chart = _chart_source(ws, root)
     pyaml = wsm.platform_yaml_path(ws, root)
@@ -610,6 +700,7 @@ def snap_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Workspace
             repo_url = pp.get("repoUrl") or repo_url
         elif prior and digest:
             _warn(f"{name}: -e {env} 에 --digest 직접 — {prior} 검증 우회(escape hatch)")
+        _digest_preflight(name, mdir, env, eff_digest)   # phantom pin 방어(G53, best-effort)
         ns = _namespace(name, _yaml_at(mdir / "module.yaml"), products)
         sets = (f"namespace={ns}",) + ((f"imageDigest={eff_digest}",) if eff_digest else ())
         if spec.get("db"):
@@ -639,26 +730,45 @@ def snap_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Workspace
         typer.secho("  무변경 — 커밋 생략 (diff = 실질 변경, G8)", dim=True)
         return
     kube.run(["git", "-C", str(snap_path), "commit", "-q", "-m", f"snap({env}): {' '.join(names)}"])
-    _ok(f"snapshot 커밋 {kube.git(['rev-parse', '--short', 'HEAD'], snap_path)} — "
-        f"{env} 쓰기 게이트: dev=CI직접·prod=PR(G8). 배포는 bee sync. push 는 --push")
-    if push:
-        kube.run(["git", "-C", str(snap_path), "push", "-q"])
-        _ok("snapshot push — 배포는 bee sync <env> / ArgoCD(G5·G7)")
+    _ok(f"snapshot 커밋 {kube.git(['rev-parse', '--short', 'HEAD'], snap_path)} "
+        f"({env} 쓰기 게이트 G8: dev=CI직접·prod=PR — 부트스트랩은 솔로라 직접)")
+    # **CI(GitHub Actions)도 local-path 모드**(헤드리스 워크스페이스 snapshot=체크아웃 경로) — 거기선 bee 가
+    # push 하면 **gate1 전에 푸시**(규칙 2 "게이트→푸시" 위반)가 된다. CI 에선 커밋만, push 는 워크플로가
+    # gate1 *후* 한다. **솔로 부트스트랩(비-CI)**만 bee 가 직접 push(SoT 착지가 목적 — 게이트는 부트스트랩
+    # 특성상 없음, --push 플래그 제거 G53). GITHUB_ACTIONS 로 구분(표준 CI 신호).
+    if os.environ.get("GITHUB_ACTIONS"):
+        typer.secho("  CI 환경 — push 생략(워크플로가 gate1 후 push, 규칙 2). 커밋만.", dim=True)
+        return
+    # 배포는 별도(snap ⊥ sync) — push 됐다고 적용 아님. manual sync 면 `bee sync` 가 배포 게이트.
+    r = kube.run(["git", "-C", str(snap_path), "push", "-q"], check=False)
+    if r.returncode == 0:
+        _ok(f"snapshot push — 배포는 `bee sync {env}`(manual 게이트, G53) / ArgoCD 단일 경로(G5·G7)")
+    else:
+        _warn(f"snapshot push 실패(커밋은 됨) — 수동 `git -C {snap_path} push` 후 `bee sync {env}`.\n"
+              f"  {(r.stderr or '').strip().splitlines()[0][:80] if (r.stderr or '').strip() else ''}")
 
 
-def sync_impl(env: str, root: Path, ws: wsm.Workspace, *, context: str = "") -> None:
-    """배포 반영(G52) — ArgoCD Application `bee-<env>` 에 sync operation 설정(kubectl).
+def sync_impl(env: str, root: Path, ws: wsm.Workspace, *, context: str = "", prune: bool = True) -> None:
+    """배포 반영(G52/G53) — ArgoCD Application `bee-<env>` 에 sync operation 설정(kubectl).
     bee 는 **직접 적용 안 함** — ArgoCD 에게 reconcile 요청하는 얇은 리모컨(G7 — 적용은 ArgoCD 단일 경로).
     **write(snap) ⊥ deploy(sync) 분리.** 컨텍스트 기본 = `kind-bee-<env>`(공유환경 클러스터, --context 로 override).
-    (자동sync 면 이미 반영 중 — sync 는 강제 refresh+reconcile · 수동sync 면 이때 적용.)
+
+    **manual sync 포스처(G53)**: app 은 syncPolicy.automated 없음 — `bee sync` 가 *유일한 배포 트리거*
+    (= 배포 게이트, snap⊥sync 가 실효). prune=true(기본) → 스냅샷에서 사라진 모듈을 클러스터에서 제거
+    (SoT 일치 — automated.prune 이 하던 것을 명시 동사로). 위험하면 `--no-prune`.
     """
     if env == "local":
         _fail("sync 는 공유 env 전용 — 인너루프는 bee up(직접). 공유 배포=ArgoCD(G7).")
     ctx = context or f"kind-bee-{env}"
     app = f"bee-{env}"
-    typer.secho(f"ArgoCD sync 요청 → app {app} (ctx={ctx}) — 적용은 ArgoCD(bee 는 리모컨, G7)", bold=True)
+    typer.secho(f"ArgoCD sync 요청 → app {app} (ctx={ctx}, prune={'on' if prune else 'off'}) "
+                f"— 적용은 ArgoCD(bee 는 리모컨, G7 · manual 배포 게이트 G53)", bold=True)
     # .operation 설정 → ArgoCD application-controller 가 sync 실행. argocd CLI 의존 없이 kubectl 만.
-    patch = '{"operation":{"initiatedBy":{"username":"bee"},"sync":{"revision":"HEAD"}}}'
+    sync_op: dict = {"revision": "HEAD"}
+    if prune:
+        sync_op["prune"] = True   # SoT 에서 사라진 리소스 제거(automated.prune 대체 — 명시 갱신, 규칙 8)
+    import json as _json
+    patch = _json.dumps({"operation": {"initiatedBy": {"username": "bee"}, "sync": sync_op}})
     kube.run(["kubectl", "--context", ctx, "-n", "argocd", "patch", "application", app,
               "--type", "merge", "-p", patch])
     _ok(f"{app} sync 트리거 — 진행 확인: kubectl --context {ctx} -n argocd get app {app} (또는 ArgoCD UI)")
@@ -751,6 +861,7 @@ def doctor_impl(*, remote_ok: bool = False) -> int:
         ("docker", ["--version"], True),
         ("git", ["--version"], True),
         ("uv", ["--version"], False),
+        ("gh", ["--version"], False),   # 원격 snap dispatch(G53) — 없으면 local-path 부트스트랩만
     ]:
         if not shutil.which(tool):
             rep("fail" if required else "warn", f"{tool} 없음{'' if required else ' (선택)'}")
@@ -1032,24 +1143,25 @@ def snap(
     modules: list[str] = typer.Argument(None, help="기본: 편집 표면 전체"),
     env: str = typer.Option(..., "-e", "--env", help="공유 env (dev/prod — G51). local 금지(규칙 7)"),
     digest: str = typer.Option("", "--digest", help="이미지 digest (dev=빌드 핀. prod 면 우회 — 보통 생략)"),
-    push: bool = typer.Option(False, "--push", help="커밋 후 원격 push"),
 ):
-    """스냅샷 SoT 에 env 엔트리 쓰기(G52) — 배포 아님(배포=`bee sync`). 검증은 CI 게이트1(규칙 2).
-    핀 출처 = 사다리 자동: dev(맨앞)=--digest 빌드 핀(생성) · prod=앞 env(dev) 핀 복사(전진, 같은 아티팩트).
-    env 별 독립 핀. (구 publish+promote 통합 — 동사 하나, -e 로 env.)"""
+    """스냅샷 SoT 에 env 엔트리 쓰기(G52/G53) — 배포 아님(배포=`bee sync`). 검증은 CI 게이트1(규칙 2).
+    **모드 자동(G53)**: snapshot=URL → bee 가 CI publish 워크플로 dispatch(사용자는 gh 안 침) ·
+    snapshot=path → bee 가 직접 write+commit+push(솔로 부트스트랩). 핀 출처 = 사다리 자동: dev(맨앞)=
+    --digest 빌드 핀(생성) · prod=앞 env 핀 복사(전진). (구 publish+promote+dispatch 통합 — 동사 하나.)"""
     root, ws = load_ctx()
-    snap_impl(env, list(modules) if modules else None, root, ws, digest=digest, push=push)
+    snap_impl(env, list(modules) if modules else None, root, ws, digest=digest)
 
 
 @app.command()
 def sync(
     env: str = typer.Argument(..., help="공유 env (dev/prod) — ArgoCD app bee-<env> sync"),
     context: str = typer.Option("", "--context", help="kubectl 컨텍스트 (기본 kind-bee-<env>)"),
+    prune: bool = typer.Option(True, "--prune/--no-prune", help="SoT 에서 사라진 모듈 제거(기본 on, G53 manual)"),
 ):
-    """배포 반영(G52) — ArgoCD 에 sync 요청(write ⊥ deploy 분리). bee 는 직접 적용 안 함, ArgoCD 리모컨(G7).
-    snap 이 스냅샷에 쓰면, sync 가 ArgoCD 에게 그 env 를 클러스터에 반영하라고 요청한다."""
+    """배포 반영(G52/G53) — ArgoCD 에 sync 요청(write ⊥ deploy 분리). bee 는 직접 적용 안 함, ArgoCD 리모컨(G7).
+    snap 이 스냅샷에 쓰면, sync 가 ArgoCD 에게 그 env 를 클러스터에 반영하라고 요청한다(manual = 배포 게이트)."""
     root, ws = load_ctx()
-    sync_impl(env, root, ws, context=context)
+    sync_impl(env, root, ws, context=context, prune=prune)
 
 
 @app.command()

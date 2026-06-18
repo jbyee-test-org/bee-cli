@@ -496,9 +496,9 @@ class BeeApp(App[None]):
         if not names:
             self.notify("snap 은 편집 표면(from-local) 전용(규칙 5)", severity="warning")
             return
-        body = "\n".join(f"[cyan]✎ {n}[/] [dim]렌더(values-dev) + 엔트리 + 스냅샷 커밋[/]" for n in names)
-        body += ("\n\n[dim]env=dev 고정(다른 env 는 CLI `-e` 로 — 졸업 경로) · 배포는 bee sync(분리)"
-                 " · digest 미주입 → 게이트1이 차단 · 무변경이면 커밋 생략(G8)[/]")
+        body = "\n".join(f"[cyan]✎ {n}[/] [dim]snapshot SoT 에 dev 엔트리 쓰기[/]" for n in names)
+        body += ("\n\n[dim]env=dev 고정(다른 env 는 CLI `-e` 로 — 졸업 경로) · 모드 자동(G53): 원격=CI dispatch"
+                 "(사용자 gh 안 침) · local-path=직접 write+push · 배포는 bee sync(분리) · digest 미주입 → 게이트1 차단[/]")
         equiv = "bee snap -e dev " + " ".join(names)
         self.push_screen(
             ConfirmScreen("snap — 스냅샷 레포 커밋", body, equiv),
