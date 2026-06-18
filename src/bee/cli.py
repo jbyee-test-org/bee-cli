@@ -557,69 +557,111 @@ def status_impl(root: Path, ws: wsm.Workspace) -> None:
         _ok(f"pin {pin[:7]} ≠ HEAD {head[:7]} 이나 내 서브그래프 변경 없음 — 무관 churn 무시(규칙 8)")
 
 
-def publish_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Workspace, *,
-                 digest: str = "", push: bool = False) -> None:
-    """렌더(digest pin) + 스냅샷 엔트리 기록 + 커밋 — 기계적 기록만, 검증은 CI 게이트1(규칙 2).
+def snap_impl(env: str, targets: list[str] | None, root: Path, ws: wsm.Workspace, *,
+              digest: str = "", push: bool = False) -> None:
+    """스냅샷 SoT 에 env 엔트리 쓰기(G52) — **배포 아님**(배포=ArgoCD, `bee sync`). 검증은 CI 게이트1(규칙 2).
 
-    공유 env 전용(규칙 7). CI 가 headless 로 재사용하는 경로(G5) — dev 는 직접 커밋(G8).
+    **핀 출처 = platform.envs 사다리 순서로 자동**:
+      · 맨 앞 env(dev) = 진입 → 핀 = `--digest`(로컬 빌드, 새 핀 *생성*).
+      · 그 다음 env(prod) = 전진 → 핀 = *앞 env* provenance 복사(같은 아티팩트 — *승격*). `--digest` 면 우회(경고).
+    **env 별 독립 핀**(prod 는 dev 가 앞서가도 복사 시점 유지). 공유 env 전용(규칙 7 — 인너는 bee up).
+    렌더 입력(module.yaml·values-<env>)은 로컬 편집표면(Tier 1; 순수형은 앞-env 스냅샷 직접 렌더 = refinement).
+    쓰기 게이트: dev=CI직접·prod=PR(G8). (구 publish + promote 통합 — G52.)
     """
     if env == "local":
-        _fail("publish 는 공유 env 전용 — 로컬 상태는 스냅샷에 기록하지 않는다(규칙 7). "
-              "로컬 구성 공유는 워크스페이스 파일로.")
+        _fail("snap 은 공유 env 전용 — 로컬은 SoT 밖(규칙 7). 인너루프는 bee up.")
     overrides = wsm.override_dirs(ws, root)
-    names = targets or sorted(overrides)
-    unknown = [n for n in names if n not in overrides]
-    if unknown:
-        _fail(f"publish 는 편집 표면(from-local) 전용(규칙 5): {', '.join(unknown)}")
-    if digest and len(names) != 1:
-        _fail("--digest 는 모듈 1개와 함께만 사용한다 (모듈별 digest 가 다르다)")
     chart = _chart_source(ws, root)
     pyaml = wsm.platform_yaml_path(ws, root)
     products = _products(ws, root)
     snap_path = _snapshot_path(root, ws)
     env_dir = snap_path / "envs" / env
-    snaps = snap_mod.load_snapshot(env_dir)  # depth 그래프 = 스냅샷의 의존 모듈 + 이번 모듈
+    snaps = snap_mod.load_snapshot(env_dir)
+    # 사다리 — 앞 env = 핀 복사 출처(전진/승격), 맨 앞 = 빌드 핀(진입)
+    ladder = list((_yaml_at(pyaml).get("spec") or {}).get("envs") or []) if pyaml else []
+    prior = ladder[ladder.index(env) - 1] if (env in ladder and ladder.index(env) > 0) else None
+    prior_snaps = snap_mod.load_snapshot(snap_path / "envs" / prior) if prior else {}
+    names = targets or sorted(overrides)
+    unknown = [n for n in names if n not in overrides]
+    if unknown:
+        _fail(f"snap 은 편집 표면(from-local) 전용(규칙 5): {', '.join(unknown)} (pull/new 로 등록)")
+    if digest and len(names) != 1:
+        _fail("--digest 는 모듈 1개와 함께만 (모듈별 digest 가 다르다)")
     for name in names:
         mdir = overrides[name]
         _chart_warnings(mdir / "module.yaml", chart, pyaml)
+        spec = _yaml_at(mdir / "module.yaml").get("spec") or {}
+        if not (mdir / f"values-{env}.yaml").exists():
+            _fail(f"{name}: values-{env}.yaml 없음 — {env} 좌표 필요(규칙 3).")
+        # 핀 출처 결정 (사다리)
+        eff_digest = digest
+        repo_url = kube.git(["remote", "get-url", "origin"], mdir) or str(mdir)
+        commit = kube.git(["rev-parse", "HEAD"], mdir)
+        chart_ver = str((spec.get("chart") or {}).get("version") or "")
+        if prior and not digest:   # 전진(승격) — 앞 env 검증된 핀 복사
+            if name not in prior_snaps:
+                _fail(f"{name}: envs/{prior} 에 없음 — 전진 원천은 검증된 {prior} 모듈(먼저 snap -e {prior}).")
+            pp = _yaml_at(prior_snaps[name].provenance) if prior_snaps[name].provenance else {}
+            eff_digest = pp.get("imageDigest") or ""
+            if chart_ver != str(pp.get("chartVersion") or ""):
+                _warn(f"{name}: 로컬 chart {chart_ver} ≠ {prior} {pp.get('chartVersion')} — {prior} 핀 기록(렌더 입력=로컬, Tier 1)")
+            commit = str(pp.get("moduleCommit") or commit)
+            chart_ver = str(pp.get("chartVersion") or chart_ver)
+            repo_url = pp.get("repoUrl") or repo_url
+        elif prior and digest:
+            _warn(f"{name}: -e {env} 에 --digest 직접 — {prior} 검증 우회(escape hatch)")
         ns = _namespace(name, _yaml_at(mdir / "module.yaml"), products)
-        sets = (f"namespace={ns}",) + ((f"imageDigest={digest}",) if digest else ())
-        if (_yaml_at(mdir / "module.yaml").get("spec") or {}).get("db"):
+        sets = (f"namespace={ns}",) + ((f"imageDigest={eff_digest}",) if eff_digest else ())
+        if spec.get("db"):
             sets += (f"migrationWave={_migration_wave(name, _all_specs({name: mdir}, snaps))}",
                      f"dbMigrationsHash={_migrations_hash(mdir)}")
             _grant_warnings(name, {name: mdir}, snaps)
         manifests = _render(chart, mdir, env, name, set_values=sets,
                             platform_values=_platform_values(ws, root))
-        spec = _yaml_at(mdir / "module.yaml").get("spec") or {}
-        prov = {
-            "module": name,
-            "repoUrl": kube.git(["remote", "get-url", "origin"], mdir) or str(mdir),
-            "moduleCommit": kube.git(["rev-parse", "HEAD"], mdir),
-            "imageDigest": digest,
-            "chartVersion": str((spec.get("chart") or {}).get("version") or ""),
-            "dependsOn": list(spec.get("dependsOn") or []),
-        }
         cm = _migrations_cm(name, mdir, ns)
         if cm:
             manifests = manifests + "\n---\n" + cm
+        prov = {
+            "module": name, "repoUrl": repo_url, "moduleCommit": commit,
+            "imageDigest": eff_digest, "chartVersion": chart_ver,
+            "dependsOn": list(spec.get("dependsOn") or []),
+        }
         db_dir = mdir / "db"
-        contracts_dir = mdir / "contracts"   # 계약 표면(openapi/asyncapi) 운반 — bee 는 복사만(파생 0, bee contracts)
+        contracts_dir = mdir / "contracts"   # 계약 표면(openapi/asyncapi) 운반 — 복사만(파생 0, bee contracts)
         snap_mod.write_entry(env_dir, name, mdir / "module.yaml", manifests, provenance=prov,
                              db_src=db_dir if db_dir.is_dir() else None,
                              contracts_src=contracts_dir if contracts_dir.is_dir() else None)
-        _ok(f"{name} → envs/{env}/{name}  "
-            + ("(digest pin)" if digest
-               else "(image 없음 — schema 모듈, G21)" if not _has_image(mdir)
-               else "(digest 없음 — 게이트1이 차단한다)"))
+        mode = (f"전진({prior}→{env}) 핀 복사" if (prior and not digest)
+                else "빌드 핀" if eff_digest else "image 없음(G21)")
+        _ok(f"{name} → envs/{env}/{name}  ({mode}" + (f": {eff_digest[:23]}…)" if eff_digest else ")"))
     kube.run(["git", "-C", str(snap_path), "add", f"envs/{env}"])
     if not kube.git(["status", "--porcelain", "--", f"envs/{env}"], snap_path):
         typer.secho("  무변경 — 커밋 생략 (diff = 실질 변경, G8)", dim=True)
         return
-    kube.run(["git", "-C", str(snap_path), "commit", "-q", "-m", f"publish({env}): {' '.join(names)}"])
-    _ok(f"snapshot 커밋 {kube.git(['rev-parse', '--short', 'HEAD'], snap_path)}")
+    kube.run(["git", "-C", str(snap_path), "commit", "-q", "-m", f"snap({env}): {' '.join(names)}"])
+    _ok(f"snapshot 커밋 {kube.git(['rev-parse', '--short', 'HEAD'], snap_path)} — "
+        f"{env} 쓰기 게이트: dev=CI직접·prod=PR(G8). 배포는 bee sync. push 는 --push")
     if push:
         kube.run(["git", "-C", str(snap_path), "push", "-q"])
-        _ok("snapshot push — 적용은 CD(ArgoCD)의 몫(G5: CLI 의 공유환경 출력은 git 까지)")
+        _ok("snapshot push — 배포는 bee sync <env> / ArgoCD(G5·G7)")
+
+
+def sync_impl(env: str, root: Path, ws: wsm.Workspace, *, context: str = "") -> None:
+    """배포 반영(G52) — ArgoCD Application `bee-<env>` 에 sync operation 설정(kubectl).
+    bee 는 **직접 적용 안 함** — ArgoCD 에게 reconcile 요청하는 얇은 리모컨(G7 — 적용은 ArgoCD 단일 경로).
+    **write(snap) ⊥ deploy(sync) 분리.** 컨텍스트 기본 = `kind-bee-<env>`(공유환경 클러스터, --context 로 override).
+    (자동sync 면 이미 반영 중 — sync 는 강제 refresh+reconcile · 수동sync 면 이때 적용.)
+    """
+    if env == "local":
+        _fail("sync 는 공유 env 전용 — 인너루프는 bee up(직접). 공유 배포=ArgoCD(G7).")
+    ctx = context or f"kind-bee-{env}"
+    app = f"bee-{env}"
+    typer.secho(f"ArgoCD sync 요청 → app {app} (ctx={ctx}) — 적용은 ArgoCD(bee 는 리모컨, G7)", bold=True)
+    # .operation 설정 → ArgoCD application-controller 가 sync 실행. argocd CLI 의존 없이 kubectl 만.
+    patch = '{"operation":{"initiatedBy":{"username":"bee"},"sync":{"revision":"HEAD"}}}'
+    kube.run(["kubectl", "--context", ctx, "-n", "argocd", "patch", "application", app,
+              "--type", "merge", "-p", patch])
+    _ok(f"{app} sync 트리거 — 진행 확인: kubectl --context {ctx} -n argocd get app {app} (또는 ArgoCD UI)")
 
 
 def pull_impl(modules: list[str], root: Path, ws: wsm.Workspace) -> None:
@@ -986,15 +1028,28 @@ def down(
 
 
 @app.command()
-def publish(
-    env: str = typer.Argument(..., help="공유 env (dev/prod — G51) — local 금지(규칙 7)"),
+def snap(
     modules: list[str] = typer.Argument(None, help="기본: 편집 표면 전체"),
-    digest: str = typer.Option("", "--digest", help="이미지 digest (CI 가 주입 — 모듈 1개와만)"),
+    env: str = typer.Option(..., "-e", "--env", help="공유 env (dev/prod — G51). local 금지(규칙 7)"),
+    digest: str = typer.Option("", "--digest", help="이미지 digest (dev=빌드 핀. prod 면 우회 — 보통 생략)"),
     push: bool = typer.Option(False, "--push", help="커밋 후 원격 push"),
 ):
-    """스냅샷 레포 커밋 — 이미지 push 는 build/CI 몫(분리). 검증은 CI 게이트1(규칙 2)."""
+    """스냅샷 SoT 에 env 엔트리 쓰기(G52) — 배포 아님(배포=`bee sync`). 검증은 CI 게이트1(규칙 2).
+    핀 출처 = 사다리 자동: dev(맨앞)=--digest 빌드 핀(생성) · prod=앞 env(dev) 핀 복사(전진, 같은 아티팩트).
+    env 별 독립 핀. (구 publish+promote 통합 — 동사 하나, -e 로 env.)"""
     root, ws = load_ctx()
-    publish_impl(env, list(modules) if modules else None, root, ws, digest=digest, push=push)
+    snap_impl(env, list(modules) if modules else None, root, ws, digest=digest, push=push)
+
+
+@app.command()
+def sync(
+    env: str = typer.Argument(..., help="공유 env (dev/prod) — ArgoCD app bee-<env> sync"),
+    context: str = typer.Option("", "--context", help="kubectl 컨텍스트 (기본 kind-bee-<env>)"),
+):
+    """배포 반영(G52) — ArgoCD 에 sync 요청(write ⊥ deploy 분리). bee 는 직접 적용 안 함, ArgoCD 리모컨(G7).
+    snap 이 스냅샷에 쓰면, sync 가 ArgoCD 에게 그 env 를 클러스터에 반영하라고 요청한다."""
+    root, ws = load_ctx()
+    sync_impl(env, root, ws, context=context)
 
 
 @app.command()

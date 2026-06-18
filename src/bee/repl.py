@@ -199,7 +199,7 @@ def _fallback_repl(root: Path):
             typer.secho(f"⚠ {e}", fg=WARN, err=True)
             return
         orient(m)
-        typer.echo("\n  " + s("1 up · 2 build · 3 down · 4 status · publish · pull · q quit", dim=True))
+        typer.echo("\n  " + s("1 up · 2 build · 3 down · 4 status · snap · pull · q quit", dim=True))
         try:
             ch = input("bee ▸ ").strip().lower()
         except EOFError:
@@ -216,10 +216,10 @@ def _fallback_repl(root: Path):
                 _fb_down(m)
             elif ch == "status":
                 cli.status_impl(root, ws)
-            elif ch == "publish":
+            elif ch in ("snap", "publish"):
                 names = sorted(m.overrides)
-                if names and confirm(f"bee publish dev {' '.join(names)}"):
-                    cli.publish_impl("dev", names, root, ws)
+                if names and confirm(f"bee snap -e dev {' '.join(names)}"):
+                    cli.snap_impl("dev", names, root, ws)
             elif ch == "pull":
                 items = [(n, "from-snapshot", "", "snap") for n in m.backdrop]
                 sel = sorted(_checklist_numbered("pull ▸ backdrop → 편집 표면", items)) if items else []
@@ -287,7 +287,7 @@ class BeeApp(App[None]):
         Binding("space", "toggle_mark", "mark", key_display="␣"),
         Binding("a", "toggle_all", "all"),
         Binding("r", "reload", "refresh"),
-        Binding("p", "publish", "publish"),
+        Binding("p", "snap", "snap"),
         Binding("e", "pull", "pull"),
         Binding("q", "quit", "quit"),
         Binding("j", "row_down", "down", show=False),
@@ -490,20 +490,20 @@ class BeeApp(App[None]):
         self._load_model()
         self.notify("오리엔트 갱신")
 
-    def action_publish(self):
+    def action_snap(self):
         m = self.model
         names = sorted(n for n in self._targets() if n in m.overrides) or sorted(m.overrides)
         if not names:
-            self.notify("publish 는 편집 표면(from-local) 전용(규칙 5)", severity="warning")
+            self.notify("snap 은 편집 표면(from-local) 전용(규칙 5)", severity="warning")
             return
         body = "\n".join(f"[cyan]✎ {n}[/] [dim]렌더(values-dev) + 엔트리 + 스냅샷 커밋[/]" for n in names)
-        body += ("\n\n[dim]env=dev 고정(다른 env 는 CLI 플래그로 — 졸업 경로) · digest 미주입"
-                 " → 게이트1이 차단 · 무변경이면 커밋 생략(G8)[/]")
-        equiv = "bee publish dev " + " ".join(names)
+        body += ("\n\n[dim]env=dev 고정(다른 env 는 CLI `-e` 로 — 졸업 경로) · 배포는 bee sync(분리)"
+                 " · digest 미주입 → 게이트1이 차단 · 무변경이면 커밋 생략(G8)[/]")
+        equiv = "bee snap -e dev " + " ".join(names)
         self.push_screen(
-            ConfirmScreen("publish — 스냅샷 레포 커밋", body, equiv),
+            ConfirmScreen("snap — 스냅샷 레포 커밋", body, equiv),
             lambda ok: self._run_suspended(
-                equiv, lambda: cli.publish_impl("dev", names, self.root, self.ws)) if ok else None,
+                equiv, lambda: cli.snap_impl("dev", names, self.root, self.ws)) if ok else None,
         )
 
     def action_pull(self):
