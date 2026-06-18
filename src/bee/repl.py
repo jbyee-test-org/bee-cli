@@ -77,6 +77,8 @@ class Model:
         # 플랫폼명 = platform.yaml metadata.name(G43 — core-infra = 1 플랫폼, 워크스페이스 바인딩에 platform 없음)
         pyaml = wsm.platform_yaml_path(ws, root)
         self.platform = (cli._yaml_at(pyaml).get("metadata") or {}).get("name") if pyaml else None
+        # env 사다리(G51 — platform.envs, 보통 [dev, prod]). build·snap 의 env 선택지 출처.
+        self.envs: list[str] = list((cli._yaml_at(pyaml).get("spec") or {}).get("envs") or []) if pyaml else []
         # 좌표(product→ns) + 배포 상태(모듈별 namespace 의 Deployment 존재 여부)
         self.coords: dict[str, str] = {}
         self.deployed: set[str] = set()
@@ -159,6 +161,18 @@ def confirm(equiv):
         return False
 
 
+def _select_env(title, options):
+    """단일 선택 폴백 — options=[(value,label,desc)]. 번호 입력. 빈입력/오입력=취소(None)."""
+    typer.echo("\n" + s(title, bold=True))
+    for i, (_val, label, desc) in enumerate(options, 1):
+        typer.echo(f"    {i}) {s(label, fg=LOCAL)}  {s(desc, dim=True)}")
+    try:
+        cc = input("  env ▸ ").strip()
+    except EOFError:
+        return None
+    return options[int(cc) - 1][0] if cc.isdigit() and 1 <= int(cc) <= len(options) else None
+
+
 def _fb_up(m: Model):
     items = [(n, "from-local", m.badge(n), "local") for n in sorted(m.overrides)] \
         + [(n, "from-snapshot", m.badge(n), "snap") for n in m.backdrop]
@@ -177,8 +191,18 @@ def _fb_build(m: Model):
                               [(n, "from-local", "", "local") for n in sorted(m.overrides)])
     if not sel:
         return
-    if confirm(f"bee build {' '.join(sorted(sel))}"):
-        cli.build_impl(sorted(sel), m.root, m.ws)
+    names = sorted(sel)
+    opts = [("local", "local", "docker build → kind load (인너)")]
+    opts += [(e, e, f"build + push → values-{e} registry → digest (아웃터)") for e in m.envs]
+    env = _select_env("build ▸ env 선택", opts)
+    if not env:
+        typer.echo("  (취소)")
+        return
+    if env == "local":
+        if confirm(f"bee build {' '.join(names)}"):
+            cli.build_impl(names, m.root, m.ws)
+    elif confirm(f"bee build -e {env} --push {' '.join(names)}"):
+        cli.build_push_impl(names, m.root, m.ws, env)
 
 
 def _fb_down(m: Model):
@@ -218,8 +242,13 @@ def _fallback_repl(root: Path):
                 cli.status_impl(root, ws)
             elif ch in ("snap", "publish"):
                 names = sorted(m.overrides)
-                if names and confirm(f"bee snap -e dev {' '.join(names)}"):
-                    cli.snap_impl("dev", names, root, ws)
+                if names:
+                    envs = m.envs or ["dev"]
+                    opts = [(e, e, "진입(핀 생성)" if i == 0 else "전진(앞 env 핀 복사·승격)")
+                            for i, e in enumerate(envs)]
+                    env = _select_env("snap ▸ env 선택 (사다리)", opts)
+                    if env and confirm(f"bee snap -e {env} {' '.join(names)}"):
+                        cli.snap_impl(env, names, root, ws)
             elif ch == "pull":
                 items = [(n, "from-snapshot", "", "snap") for n in m.backdrop]
                 sel = sorted(_checklist_numbered("pull ▸ backdrop → 편집 표면", items)) if items else []
@@ -263,6 +292,41 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class SelectScreen(ModalScreen[str]):
+    """단일 선택 모달 — env 등 옵션 하나 고르기(번호키 선택 · esc 취소). 취소 시 None.
+
+    가이드 프롬프트의 *앞단계*: 무엇을 할지 정하기 전에 어디에(env) 를 먼저 고른다.
+    confirm 으로 이어진다(SelectScreen → ConfirmScreen → 실행)."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "취소", show=False),
+    ]
+
+    def __init__(self, title: str, options: list[tuple[str, str, str]], *, hint: str = ""):
+        super().__init__()
+        self._title, self._options, self._hint = title, options, hint
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="dialog") as v:
+            v.border_title = f" {self._title} "
+            lines = [f"[bold yellow]{i}[/]) [bold cyan]{label}[/]  [dim]{desc}[/]"
+                     for i, (_val, label, desc) in enumerate(self._options, 1)]
+            yield Static("\n".join(lines), id="s-body")
+            if self._hint:
+                yield Static(f"[dim]{self._hint}[/]", id="s-hint")
+            yield Static(f"[b]1-{len(self._options)}[/][dim] 선택  ·[/] [b]esc[/][dim] 취소[/]", id="s-keys")
+
+    def on_key(self, event):
+        if event.character and event.character.isdigit():
+            i = int(event.character)
+            if 1 <= i <= len(self._options):
+                self.dismiss(self._options[i - 1][0])
+                event.stop()
+
+    def action_cancel(self):
+        self.dismiss(None)
+
+
 class BeeApp(App[None]):
     """k9s 스타일 오리엔트: 헤더(컨텍스트) + 모듈 테이블 + 키 힌트 바."""
 
@@ -272,11 +336,14 @@ class BeeApp(App[None]):
     #logo { width: auto; color: yellow; }
     #modules { height: 1fr; border: round cyan; }
     ConfirmScreen { align: center middle; }
+    SelectScreen { align: center middle; }
     #dialog { width: 76; height: auto; padding: 1 2; background: $surface; border: round cyan; }
     ConfirmScreen.tone-warn #dialog { border: round yellow; }
     ConfirmScreen.tone-danger #dialog { border: round red; }
     #c-equiv { margin-top: 1; }
     #c-keys { margin-top: 1; }
+    #s-hint { margin-top: 1; }
+    #s-keys { margin-top: 1; }
     """
 
     BINDINGS = [
@@ -467,11 +534,27 @@ class BeeApp(App[None]):
         if not names:
             self.notify("build 는 from-local 전용(규칙 5) — 편집 표면 모듈을 선택", severity="warning")
             return
-        body = "\n".join(f"[cyan]✎ {n}[/] [dim]docker build → kind load[/]" for n in names)
-        equiv = "bee build " + " ".join(names)
+        # env 선택: local=인너(docker→kind) · dev/prod=아웃터(values-<env> registry push → digest)
+        opts = [("local", "local", "docker build → kind load (인너루프)")]
+        opts += [(e, e, f"build + push → values-{e} registry → digest (아웃터)") for e in m.envs]
         self.push_screen(
-            ConfirmScreen("build — 이미지 (from-local → kind)", body, equiv),
-            lambda ok: self._run_suspended(equiv, lambda: cli.build_impl(names, self.root, self.ws)) if ok else None,
+            SelectScreen("build ▸ env 선택", opts, hint="local=인너(kind 적재) · dev/prod=아웃터(registry push)"),
+            lambda env: self._build_env(names, env) if env else None,
+        )
+
+    def _build_env(self, names: list[str], env: str):
+        if env == "local":
+            body = "\n".join(f"[cyan]✎ {n}[/] [dim]docker build → kind load[/]" for n in names)
+            equiv = "bee build " + " ".join(names)
+            fn = lambda: cli.build_impl(names, self.root, self.ws)  # noqa: E731
+        else:
+            body = "\n".join(f"[cyan]✎ {n}[/] [dim]build + push → values-{env} registry → digest[/]" for n in names)
+            body += f"\n\n[dim]digest 산출 → `bee snap -e {env} --digest <D>`(G53 — 원격이면 bee 가 CI dispatch)[/]"
+            equiv = f"bee build -e {env} --push " + " ".join(names)
+            fn = lambda: cli.build_push_impl(names, self.root, self.ws, env)  # noqa: E731
+        self.push_screen(
+            ConfirmScreen(f"build — 이미지 (env={env})", body, equiv),
+            lambda ok: self._run_suspended(equiv, fn) if ok else None,
         )
 
     def action_do_down(self):
@@ -496,14 +579,25 @@ class BeeApp(App[None]):
         if not names:
             self.notify("snap 은 편집 표면(from-local) 전용(규칙 5)", severity="warning")
             return
-        body = "\n".join(f"[cyan]✎ {n}[/] [dim]snapshot SoT 에 dev 엔트리 쓰기[/]" for n in names)
-        body += ("\n\n[dim]env=dev 고정(다른 env 는 CLI `-e` 로 — 졸업 경로) · 모드 자동(G53): 원격=CI dispatch"
-                 "(사용자 gh 안 침) · local-path=직접 write+push · 배포는 bee sync(분리) · digest 미주입 → 게이트1 차단[/]")
-        equiv = "bee snap -e dev " + " ".join(names)
+        # env 선택: 사다리(G51) — 맨앞(dev)=진입(핀 생성) · 다음(prod)=전진(앞 env 핀 복사, 승격)
+        envs = m.envs or ["dev"]
+        opts = [(e, e, "진입 — 빌드 핀(--digest, dev 이미지 모듈)" if i == 0 else "전진 — 앞 env 핀 복사(승격)")
+                for i, e in enumerate(envs)]
         self.push_screen(
-            ConfirmScreen("snap — 스냅샷 레포 커밋", body, equiv),
+            SelectScreen("snap ▸ env 선택 (사다리 G51)", opts,
+                         hint="dev=진입(핀 생성) · prod=전진(핀 복사). 모드 자동(G53): 원격=CI dispatch · local-path=직접"),
+            lambda env: self._snap_env(names, env) if env else None,
+        )
+
+    def _snap_env(self, names: list[str], env: str):
+        body = "\n".join(f"[cyan]✎ {n}[/] [dim]snapshot SoT 에 {env} 엔트리 쓰기[/]" for n in names)
+        body += ("\n\n[dim]모드 자동(G53): 원격=CI dispatch(사용자 gh 안 침) · local-path=직접 write+push · "
+                 f"배포는 `bee sync {env}`(분리). dev 이미지 모듈은 digest 필요(REPL 미주입 — CLI `--digest`)[/]")
+        equiv = f"bee snap -e {env} " + " ".join(names)
+        self.push_screen(
+            ConfirmScreen("snap — 스냅샷 SoT 쓰기", body, equiv),
             lambda ok: self._run_suspended(
-                equiv, lambda: cli.snap_impl("dev", names, self.root, self.ws)) if ok else None,
+                equiv, lambda: cli.snap_impl(env, names, self.root, self.ws)) if ok else None,
         )
 
     def action_pull(self):
