@@ -61,6 +61,11 @@ class Workspace:
     core_infra_ref: str = "main"         # core_infra_repo 의 ref(브랜치=floating·40-hex=pin, 규칙 8)
     chart_ref: str | None = None         # oci://… — 있으면 OCI 소비(G6), 모듈 pin 이 --version
     cluster_context: str | None = None   # 인너루프 클러스터 kubectl 컨텍스트 (G7)
+    # 이미지 registry(G54) — **env 불변 좌표**(G52 same-artifact: 빌드 1회 digest 가 dev→prod 복사 ⇒
+    # registry 가 사다리 전체 동일해야). 그래서 values-<env>(env별) 도 module.yaml(origin-free 위반) 도 아닌
+    # **워크스페이스**가 거처. build push 타깃 + render 이미지 ref({registry}/{name}@digest|:tag) 양쪽 출처.
+    # bee 가 chart 에 `--set registry=` 주입(파생 0). buildRegistries(cargo 빌드-의존)와 별개.
+    image_registry: str | None = None
     locals: dict[str, LocalOverride] = field(default_factory=dict)
     # 빌드 사설 registry(G30) — [{name, index, tokenEnv}]. bee build 가 token 을 BuildKit secret
     # (id=<name>_token, env=tokenEnv)으로 주입 · doctor 가 도달+tokenEnv 점검. 빌드는 bee 경계 밖이나
@@ -94,6 +99,8 @@ class Workspace:
             doc["coreInfra"] = ci
         if self.cluster_context:
             doc["cluster"] = {"context": self.cluster_context}
+        if self.image_registry:
+            doc["imageRegistry"] = self.image_registry
         if self.build_registries:
             doc["buildRegistries"] = self.build_registries
         doc["local"] = local_out
@@ -121,6 +128,7 @@ class Workspace:
             core_infra_ref=ci.get("ref", "main"),
             chart_ref=ci.get("chartRef"),
             cluster_context=(data.get("cluster") or {}).get("context"),
+            image_registry=data.get("imageRegistry") or os.environ.get("BEE_IMAGE_REGISTRY"),
             locals=locals_,
             build_registries=list(data.get("buildRegistries") or []),
         )

@@ -169,32 +169,38 @@ def _render(chart, mdir: Path, env: str, name: str, set_values: tuple[str, ...] 
 
 
 def _platform_values(ws: wsm.Workspace, root: Path) -> dict:
-    """platform.yaml 에서 chart 가 룩업할 데이터 → `.Values.{resources,provides}`:
-    resources(G37 리소스 프로파일 — spec.uses 룩업) · provides(G36/G28③ provider 바인딩 — provider 코덱 dispatch).
-    bee 는 *전달*만(derive 0); 룩업·렌더는 chart(rule 1). 없으면 {}(미선언 모듈 무영향)."""
+    """chart 가 룩업할 **저우선 default** 데이터(`_render` 의 가장 낮은 -f — 모듈 values 가 override):
+    resources(G37 — spec.uses 룩업) · provides(G36/G28③ provider 코덱 dispatch) · **registry(G54 —
+    워크스페이스 imageRegistry, env 불변)**. bee 는 *전달*만(derive 0); 룩업·렌더는 chart(rule 1).
+
+    registry 가 **저우선**인 이유: 보통 모듈은 ws.imageRegistry 를 쓰지만, 공개 백엔드 이미지를 쓰는
+    특수 모듈(예: nginx-probe = `traefik/whoami`)은 values-<env>.registry 로 *override* 한다.
+    그래서 --set(고우선)이 아니라 default 로 깔고 values 가 이긴다."""
     try:
         p = wsm.platform_yaml_path(ws, root)
     except wsm.WorkspaceError:
-        return {}
+        p = None
     spec = (_yaml_at(p).get("spec") or {}) if p else {}
     out: dict = {}
     if spec.get("resources"):
         out["resources"] = spec["resources"]
     if (spec.get("substrate") or {}).get("provides"):
         out["provides"] = spec["substrate"]["provides"]
+    if ws.image_registry:
+        out["registry"] = ws.image_registry   # 저우선 default — 모듈 values 가 override 가능(probe 등)
     return out
 
 
-def _image_ref(mdir: Path, env: str = "local") -> tuple[str | None, str | None]:
-    """(registry, image) — registry 는 values-<env>.yaml(좌표, 규칙 3), image 는 module.yaml.
-    push 타깃 registry 가 env 마다 다르므로(local=localhost/dev, dev=ghcr…) env 로 고른다."""
-    m, v = _yaml_at(mdir / "module.yaml"), _yaml_at(mdir / f"values-{env}.yaml")
-    image = ((m.get("spec") or {}).get("image") or {}).get("name")
-    return v.get("registry"), image
+def _image_ref(ws: wsm.Workspace, mdir: Path) -> tuple[str | None, str | None]:
+    """(registry, image) — registry 는 **워크스페이스 imageRegistry**(G54 — env 불변 좌표;
+    G52 same-artifact 가 사다리 전체 동일 registry 를 요구), image 는 module.yaml spec.image.name.
+    빌드 push 타깃 · render 이미지 ref 양쪽 공용. (구: values-<env>.registry — env별 중복이라 회수.)"""
+    image = ((_yaml_at(mdir / "module.yaml").get("spec") or {}).get("image") or {}).get("name")
+    return ws.image_registry, image
 
 
-def _image_tag(mdir: Path) -> str:
-    registry, image = _image_ref(mdir, "local")
+def _image_tag(ws: wsm.Workspace, mdir: Path) -> str:
+    registry, image = _image_ref(ws, mdir)
     v = _yaml_at(mdir / "values-local.yaml")
     return f"{registry}/{image}:{v.get('imageTag', 'local')}"
 
@@ -373,17 +379,18 @@ def build_impl(names: list[str], root: Path, ws: wsm.Workspace) -> None:
         if not _has_image(overrides[name]):
             typer.secho(f"  {name}: image 없음 — schema 모듈(G21), build 생략", dim=True)
             continue
-        tag = _image_tag(overrides[name])
+        tag = _image_tag(ws, overrides[name])
         kube.docker_build(tag, overrides[name], _build_secrets(ws, root))
         kube.kind_load(tag, cluster)
         _ok(f"{name}: docker build → kind load ({tag})")
 
 
-def build_push_impl(names: list[str], root: Path, ws: wsm.Workspace, env: str) -> None:
-    """아웃터 이미지 준비(G31/C) — values-<env> registry 로 build+push → digest 출력.
+def build_push_impl(names: list[str], root: Path, ws: wsm.Workspace) -> None:
+    """아웃터 이미지 준비(G31/C) — **워크스페이스 imageRegistry**(G54 — env 불변)로 build+push → digest 출력.
     빌드는 빌더 책임(G30)이라 CI 가 아니라 토큰 가진 로컬이 한다. **정합 가드**(소스↔이미지↔스냅샷, #2):
     커밋된 클린 트리만 빌드하고 `sha-<commit>` 으로 태깅 → CI 가 모듈@commit 체크아웃해 publish 하면
-    provenance(moduleCommit=commit, imageDigest=digest)가 닫힌다. 매니페스트는 digest pin(태그 무관)."""
+    provenance(moduleCommit=commit, imageDigest=digest)가 닫힌다. 매니페스트는 digest pin(태그 무관).
+    (env 인자 없음 — 빌드 1회 → digest 가 사다리 전체 복사, G52. registry 도 env 불변, G54.)"""
     overrides = wsm.override_dirs(ws, root)
     secrets = _build_secrets(ws, root)
     for name in names:
@@ -401,16 +408,17 @@ def build_push_impl(names: list[str], root: Path, ws: wsm.Workspace, env: str) -
                   f"(CI 가 모듈@commit 체크아웃 → moduleCommit↔imageDigest 정합, #2). repos/{name} 에서 git init + 커밋")
         if kube.git(["status", "--porcelain"], mdir):
             _fail(f"{name}: 작업 트리 dirty — --push 는 커밋된 소스만(소스↔이미지↔스냅샷 정합, #2). 커밋 후 재시도")
-        registry, image = _image_ref(mdir, env)
+        registry, image = _image_ref(ws, mdir)
         if not registry:
-            _fail(f"{name}: values-{env}.yaml 에 registry 없음 — push 타깃 좌표 필요(규칙 3)")
+            _fail(f"{name}: 워크스페이스 imageRegistry 없음 — push 타깃 좌표 필요(G54). "
+                  f"bee.workspace.yaml 에 `imageRegistry: <registry>` 추가.")
         tag = f"{registry}/{image}:sha-{commit[:7]}"
         kube.docker_build(tag, mdir, secrets)
         digest = kube.docker_push(tag)
         _ok(f"{name}: build+push → {tag}")
         typer.secho(f"     digest: {digest}", fg=OK, bold=True)
-        # 다음 = bee snap(원격 모드면 bee 가 CI dispatch 흡수 — 사용자는 gh 안 침, G53).
-        typer.secho(f"     다음: bee snap -e {env} {name} --digest {digest}", dim=True)
+        # 다음 = bee snap -e dev(엔트리 — 원격 모드면 bee 가 CI dispatch 흡수, 사용자는 gh 안 침, G53).
+        typer.secho(f"     다음: bee snap -e dev {name} --digest {digest}", dim=True)
 
 
 def _apply_local_secrets(name: str, mdir: Path, ns: str, ctx: str) -> None:
@@ -446,7 +454,7 @@ def up_impl(roots: list[str] | None, root: Path, ws: wsm.Workspace, *, no_build:
         if name in overrides:
             mdir = overrides[name]
             if not no_build and _has_image(mdir):   # image 없으면 schema 모듈(G21) — build 생략
-                tag = _image_tag(mdir)
+                tag = _image_tag(ws, mdir)
                 kube.docker_build(tag, mdir, _build_secrets(ws, root))
                 kube.kind_load(tag, ctx.removeprefix("kind-"))
             _chart_warnings(mdir / "module.yaml", chart, pyaml)
@@ -573,13 +581,13 @@ def _module_repo_slug(mdir: Path) -> str | None:
 PUBLISH_WORKFLOW = "publish-{env}.yaml"
 
 
-def _digest_preflight(name: str, mdir: Path, env: str, digest: str) -> None:
+def _digest_preflight(ws: wsm.Workspace, name: str, mdir: Path, digest: str) -> None:
     """phantom pin 방어(G53) — 핀할 digest 가 registry 에 *실재*하는지 best-effort 확인(local-path 모드).
     `docker manifest inspect {registry}/{image}@{digest}`(로컬 docker 자격증명 사용). 실패는 **경고만**(규칙 2 —
     하드 게이트는 CI gate1 의 crane 체크). 인증·네트워크 미비로도 실패할 수 있어 차단하지 않는다(false-negative 회피)."""
     if not digest:
         return
-    registry, image = _image_ref(mdir, env)
+    registry, image = _image_ref(ws, mdir)
     if not registry or not image:
         return
     ref = f"{registry}/{image}@{digest}"
@@ -700,7 +708,7 @@ def _snap_local(env: str, targets: list[str] | None, root: Path, ws: wsm.Workspa
             repo_url = pp.get("repoUrl") or repo_url
         elif prior and digest:
             _warn(f"{name}: -e {env} 에 --digest 직접 — {prior} 검증 우회(escape hatch)")
-        _digest_preflight(name, mdir, env, eff_digest)   # phantom pin 방어(G53, best-effort)
+        _digest_preflight(ws, name, mdir, eff_digest)   # phantom pin 방어(G53, best-effort)
         ns = _namespace(name, _yaml_at(mdir / "module.yaml"), products)
         sets = (f"namespace={ns}",) + ((f"imageDigest={eff_digest}",) if eff_digest else ())
         if spec.get("db"):
@@ -912,6 +920,13 @@ def doctor_impl(*, remote_ok: bool = False) -> int:
     except Exception as e:
         rep("fail", f"snapshot — {e}")
 
+    # 이미지 registry(G54 — env 불변 좌표, build push·render 공용). 없으면 image 모듈 build/render 막힘.
+    if ws.image_registry:
+        rep("ok", f"imageRegistry: {ws.image_registry} (G54 — env 불변)")
+    else:
+        rep("warn", "imageRegistry 없음 — image 모듈 build --push·render 막힘. "
+                    "bee.workspace.yaml 에 `imageRegistry: <registry>`(G54)")
+
     overrides: dict = {}
     try:
         overrides = wsm.override_dirs(ws, root)
@@ -1105,15 +1120,16 @@ def render(
 @app.command()
 def build(
     modules: list[str] = typer.Argument(None, help="기본: 편집 표면 전체"),
-    env: str = typer.Option("local", "-e", "--env", help="좌표 env — --push 의 registry 선택(values-<env>)"),
-    push: bool = typer.Option(False, "--push", help="values-<env> registry 로 빌드+푸시 → digest(아웃터 이미지 준비, C). 기본=kind-load(인너)"),
+    push: bool = typer.Option(False, "--push", help="imageRegistry 로 빌드+푸시 → digest(아웃터 이미지 준비, C). 기본=kind-load(인너)"),
 ):
-    """from-local 이미지 빌드. 기본 = docker build + kind load(인너루프). --push = values-<env>
-    registry 로 푸시 + digest 출력(아웃터 — CI 는 그 digest 로 publish 만, Kellnr 토큰 미접촉)."""
+    """from-local 이미지 빌드. 기본 = docker build + kind load(인너루프). --push = 워크스페이스
+    imageRegistry(G54 — env 불변)로 푸시 + digest 출력(아웃터 — CI 는 그 digest 로 publish 만).
+    **env 인자 없음(G54)**: registry 가 워크스페이스(env 불변)라 build 는 env 무관 — 빌드 1회 → digest 가
+    사다리 전체 복사(G52). digest → `bee snap -e dev --digest`(엔트리)."""
     root, ws = load_ctx()
     names = list(modules) if modules else sorted(wsm.override_dirs(ws, root))
     if push:
-        build_push_impl(names, root, ws, env)
+        build_push_impl(names, root, ws)
     else:
         build_impl(names, root, ws)
 
@@ -1271,7 +1287,9 @@ version: 1
 snapshot:  { repo: "https://github.com/CHANGEME-ORG/bee-snapshot.git", env: dev, ref: main }
 coreInfra: { repo: "https://github.com/CHANGEME-ORG/bee-core-infra.git", ref: main, chartRef: "oci://ghcr.io/CHANGEME-ORG/charts/bee-module" }   # core-infra = 1 플랫폼(G43); 이름은 platform.yaml metadata.name
 cluster: { context: kind-bee-local }                       # 인너루프 kubectl 컨텍스트(G7 — 공유환경 금지)
-# 빌드 사설 registry(G30) — 토큰은 bee.secrets.local.yaml[tokenEnv](또는 실제 env)에서 해석.
+# 이미지 registry(G54) — build push 타깃 + render 이미지 ref. **env 불변**(G52 — 빌드 1회 digest 가 사다리 복사).
+imageRegistry: "CHANGEME-REGISTRY"   # 예: ghcr.io/<org>/<product> (module image name 이 뒤에 붙는다)
+# 빌드 사설 registry(G30 — cargo/npm 등 *빌드 의존*, 이미지 registry 와 별개) — 토큰은 bee.secrets.local.yaml[tokenEnv].
 buildRegistries: []
 #  - { name: kellnr, index: "sparse+http://HOST:PORT/api/v1/crates/", tokenEnv: CARGO_REGISTRIES_KELLNR_TOKEN }
 local: {}   # <module>: { path: repos/<module> } — `bee pull <module>` 가 채운다(편집 표면, 규칙 5)

@@ -192,17 +192,20 @@ def _fb_build(m: Model):
     if not sel:
         return
     names = sorted(sel)
-    opts = [("local", "local", "docker build → kind load (인너)")]
-    opts += [(e, e, f"build + push → values-{e} registry → digest (아웃터)") for e in m.envs]
-    env = _select_env("build ▸ env 선택", opts)
-    if not env:
+    reg = m.ws.image_registry or "imageRegistry"   # registry = 워크스페이스(env 불변, G54)
+    opts = [
+        ("local", "local", "docker build → kind load (인너)"),
+        ("push", "push → registry", f"build + push → {reg} → digest (아웃터)"),
+    ]
+    mode = _select_env("build ▸ local / push", opts)
+    if not mode:
         typer.echo("  (취소)")
         return
-    if env == "local":
+    if mode == "local":
         if confirm(f"bee build {' '.join(names)}"):
             cli.build_impl(names, m.root, m.ws)
-    elif confirm(f"bee build -e {env} --push {' '.join(names)}"):
-        cli.build_push_impl(names, m.root, m.ws, env)
+    elif confirm(f"bee build --push {' '.join(names)}"):
+        cli.build_push_impl(names, m.root, m.ws)
 
 
 def _fb_down(m: Model):
@@ -534,26 +537,33 @@ class BeeApp(App[None]):
         if not names:
             self.notify("build 는 from-local 전용(규칙 5) — 편집 표면 모듈을 선택", severity="warning")
             return
-        # env 선택: local=인너(docker→kind) · dev/prod=아웃터(values-<env> registry push → digest)
-        opts = [("local", "local", "docker build → kind load (인너루프)")]
-        opts += [(e, e, f"build + push → values-{e} registry → digest (아웃터)") for e in m.envs]
+        # build 의 축 = env 아님, **--push 하나**(인너 kind-load ⊥ 아웃터 registry push). registry 는
+        # **워크스페이스 imageRegistry**(env 불변, G54 — G52 same-artifact: 빌드 1회 → digest 복사 dev→prod).
+        # "prod build" 는 없다(복사지 빌드 아님) · build 는 env 무관.
+        reg = self.ws.image_registry or "imageRegistry"
+        opts = [
+            ("local", "local", "docker build → kind load (인너루프)"),
+            ("push", "push → registry", f"build + push → {reg} → digest (아웃터)"),
+        ]
         self.push_screen(
-            SelectScreen("build ▸ env 선택", opts, hint="local=인너(kind 적재) · dev/prod=아웃터(registry push)"),
-            lambda env: self._build_env(names, env) if env else None,
+            SelectScreen("build ▸ local / push", opts,
+                         hint="local=인너(kind 적재) · push=아웃터(imageRegistry 푸시 → digest). registry=워크스페이스(G54)"),
+            lambda mode: self._build_mode(names, mode) if mode else None,
         )
 
-    def _build_env(self, names: list[str], env: str):
-        if env == "local":
+    def _build_mode(self, names: list[str], mode: str):
+        if mode == "local":
             body = "\n".join(f"[cyan]✎ {n}[/] [dim]docker build → kind load[/]" for n in names)
             equiv = "bee build " + " ".join(names)
             fn = lambda: cli.build_impl(names, self.root, self.ws)  # noqa: E731
-        else:
-            body = "\n".join(f"[cyan]✎ {n}[/] [dim]build + push → values-{env} registry → digest[/]" for n in names)
-            body += f"\n\n[dim]digest 산출 → `bee snap -e {env} --digest <D>`(G53 — 원격이면 bee 가 CI dispatch)[/]"
-            equiv = f"bee build -e {env} --push " + " ".join(names)
-            fn = lambda: cli.build_push_impl(names, self.root, self.ws, env)  # noqa: E731
+        else:  # push (아웃터) — registry=워크스페이스 imageRegistry(G54, env 불변). digest → snap --digest.
+            reg = self.ws.image_registry or "imageRegistry"
+            body = "\n".join(f"[cyan]✎ {n}[/] [dim]build + push → {reg} → digest[/]" for n in names)
+            body += "\n\n[dim]digest 산출 → `bee snap -e dev --digest <D>`(G53 — 원격이면 bee 가 CI dispatch). prod 는 복사(승격)[/]"
+            equiv = "bee build --push " + " ".join(names)
+            fn = lambda: cli.build_push_impl(names, self.root, self.ws)  # noqa: E731
         self.push_screen(
-            ConfirmScreen(f"build — 이미지 (env={env})", body, equiv),
+            ConfirmScreen(f"build — 이미지 ({mode})", body, equiv),
             lambda ok: self._run_suspended(equiv, fn) if ok else None,
         )
 
